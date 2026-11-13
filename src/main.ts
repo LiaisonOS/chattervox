@@ -385,7 +385,11 @@ async function main() {
     })
 
     // if this subcommand is any of the commands that signs something
-    if (['chat', 'send', 'receive', 'bridge'].includes(args.subcommand)) {
+    // NOTE: `bridge` is intentionally excluded — it is a long-running GUI
+    // backend and must not process.exit(1) when the signing key doesn't match
+    // the current callsign (e.g. right after the operator renames the
+    // station). The bridge degrades to unsigned and reports it to the GUI.
+    if (['chat', 'send', 'receive'].includes(args.subcommand)) {
         validateSigningKeyExists(conf, ks)
     }
 

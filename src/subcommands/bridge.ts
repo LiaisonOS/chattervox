@@ -43,8 +43,21 @@ function emit(obj: any): void {
 export async function main(args: any, conf: Config, ks: Keystore): Promise<number> {
 
     const messenger = new Messenger(conf, ks)
-    // Sign by default when the config has a signing key (same rule as `chat`).
-    const signDefault: boolean = typeof conf.signingKey === 'string'
+    // Sign by default ONLY when config.signingKey actually matches a keypair in
+    // the keystore for the CURRENT callsign. After a station rename the old key
+    // won't match — degrade to unsigned instead of crashing, and warn the GUI.
+    let signDefault = false
+    let signingWarning = ''
+    if (typeof conf.signingKey === 'string' && conf.signingKey.length > 0) {
+        let hasKey = false
+        try {
+            hasKey = ks.getKeyPairs(conf.callsign)
+                       .some((k: any) => k.public === conf.signingKey)
+        } catch (e) { hasKey = false }
+        if (hasKey) signDefault = true
+        else signingWarning = `No signing key for ${conf.callsign} in the keystore — sending UNSIGNED. ` +
+                              `Run "chattervox genkey" (or restart the Chattervox mode) to create one.`
+    }
 
     // Rooms we're listening to. CQ is always joined. Names are upper-cased and
     // validated against the AX.25 callsign rule (1-6 alphanumeric chars).
@@ -99,6 +112,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     emit({ type: 'status', state: 'open' })
     emit({ type: 'ready', callsign: conf.callsign, ssid: conf.ssid,
            signing: signDefault, rooms: roomList() })
+    if (signingWarning) emit({ type: 'error', error: signingWarning })
 
     // Read newline-delimited JSON commands from the GUI.
     const rl = readline.createInterface({ input: process.stdin })
