@@ -14,6 +14,7 @@ import * as send from './subcommands/send'
 import * as receive from './subcommands/receive'
 import * as exec from './subcommands/exec'
 import * as tty from './subcommands/tty'
+import * as bridge from './subcommands/bridge'
 import { interactiveInit } from './ui/init'
 import { isCallsign, isCallsignSSID, isBrokenPipeError } from './utils'
 
@@ -275,6 +276,13 @@ function parseArgs(): any {
         help: 'Receive all messages, independent of signatures and destinations.',
     })
 
+    const bridge: ArgumentParser = subs.addParser('bridge', {
+        addHelp: true,
+        description: 'Headless JSON-lines interface over stdio for GUI front-ends (QtChattervox).'
+    })
+
+    bridge; // intentionally unused (no extra arguments for now)
+
 
     return parser.parseArgs()
 }
@@ -377,7 +385,7 @@ async function main() {
     })
 
     // if this subcommand is any of the commands that signs something
-    if (['chat', 'send', 'receive'].includes(args.subcommand)) {
+    if (['chat', 'send', 'receive', 'bridge'].includes(args.subcommand)) {
         validateSigningKeyExists(conf, ks)
     }
 
@@ -394,6 +402,7 @@ async function main() {
             case 'genkey': code = await genkey.main(args, conf, ks); break
             case 'exec': code = await exec.main(args, conf, ks); break
             case 'tty': code = await tty.main(args, conf, ks); break
+            case 'bridge': code = await bridge.main(args, conf, ks); break
         }
     } catch (err) {
         if (isBrokenPipeError(err)) {
