@@ -160,10 +160,15 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     // self to path) until it reaches dest, which delivers. Dedup by <id>.
     const MESH_PREFIX = '\x01MESH\x01'
     const MESH_MAX_HOPS = 2
+    const MESH_JITTER_MIN = 500       // ms — random relay backoff window
+    const MESH_JITTER_MAX = 3000
     const seenMeshIds: Set<string> = new Set<string>()
+    // Slice 2: relays we've SCHEDULED but not yet sent (id -> timer). If we hear
+    // another station relay the same id first, we cancel ours (overhear-cancel).
+    const pendingForwards: Map<string, ReturnType<typeof setTimeout>> = new Map()
     const noteMeshId = (id: string) => {
         seenMeshIds.add(id)
-        if (seenMeshIds.size > 1000) seenMeshIds.clear()   // crude bound (Slice 1)
+        if (seenMeshIds.size > 1000) seenMeshIds.clear()   // crude bound
     }
     const buildMesh = (id: string, ttl: number, origin: string, dest: string,
                        path: string, inner: string) =>
@@ -312,8 +317,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const dest = p[3] || ''
             const path = p[4] || ''
             const inner = p.slice(5).join('\x01')
-            if (!id || seenMeshIds.has(id)) return     // dedup
+            if (!id) return
+            const relayedCopy = (fromStr !== origin)   // a relay (not the origin) transmitted it
+
+            // Overhear-cancellation: if we had this id scheduled to relay and we
+            // just heard ANOTHER station relay it, cancel ours — only one fires.
+            if (pendingForwards.has(id)) {
+                if (relayedCopy) {
+                    clearTimeout(pendingForwards.get(id) as ReturnType<typeof setTimeout>)
+                    pendingForwards.delete(id)
+                    emit({ type: 'mesh-relay-cancelled', id, by: fromStr, ts: Date.now() })
+                }
+                return                                 // already scheduled — ignore the duplicate
+            }
+            if (seenMeshIds.has(id)) return            // already handled (delivered/forwarded)
             noteMeshId(id)
+
             if (dest === conf.callsign) {              // delivered to us
                 emit({
                     type: 'mesh-msg', origin, dest, text: inner, path,
@@ -322,13 +341,19 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
                 })
                 return
             }
-            // Forward (Slice 1: immediately; Slice 2 adds jitter + cancellation).
+            // Schedule a forward with random jitter; if another relay beats us to
+            // it (heard above), it gets cancelled before this fires.
             const pathList = path ? path.split(',') : []
             if (ttl > 0 && origin !== conf.callsign && !pathList.includes(conf.callsign)) {
-                const newPath = (path ? path + ',' : '') + conf.callsign
-                messenger.send(dest, buildMesh(id, ttl - 1, origin, dest, newPath, inner),
-                               signDefault).catch(() => {})
-                emit({ type: 'mesh-relayed', id, origin, dest, ts: Date.now() })
+                const jitter = MESH_JITTER_MIN + Math.random() * (MESH_JITTER_MAX - MESH_JITTER_MIN)
+                const timer = setTimeout(() => {
+                    pendingForwards.delete(id)
+                    const newPath = (path ? path + ',' : '') + conf.callsign
+                    messenger.send(dest, buildMesh(id, ttl - 1, origin, dest, newPath, inner),
+                                   signDefault).catch(() => {})
+                    emit({ type: 'mesh-relayed', id, origin, dest, ts: Date.now() })
+                }, jitter)
+                pendingForwards.set(id, timer)
             }
             return
         }
