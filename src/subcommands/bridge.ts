@@ -226,6 +226,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const MESH_MAX_HOPS = 2
     const MESH_JITTER_MIN = 500       // ms — random relay backoff window
     const MESH_JITTER_MAX = 3000
+    const MESH_JITTER_FLOOR = 300     // never beat the TNC's own timing (Slice 6)
     const seenMeshIds: Set<string> = new Set<string>()
     // Slice 2: relays we've SCHEDULED but not yet sent (id -> timer). If we hear
     // another station relay the same id first, we cancel ours (overhear-cancel).
@@ -424,7 +425,18 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             // it (heard above), it gets cancelled before this fires.
             const pathList = path ? path.split(',') : []
             if (ttl > 0 && origin !== conf.callsign && !pathList.includes(conf.callsign)) {
-                const jitter = MESH_JITTER_MIN + Math.random() * (MESH_JITTER_MAX - MESH_JITTER_MIN)
+                // Weighted jitter (Slice 6): a relay that hears the DEST more
+                // recently is a better relay, so bias its delay shorter → it
+                // wins the overhear-cancellation race and the worse relays cancel.
+                const range = MESH_JITTER_MAX - MESH_JITTER_MIN
+                let jitter = MESH_JITTER_MIN + Math.random() * range
+                const destHeardTs = heard.get(dest.split('-')[0])
+                if (destHeardTs) {
+                    const ageS = (Date.now() - destHeardTs) / 1000
+                    const bias = Math.max(0, 1 - ageS / HEARD_WINDOW_S)   // 1=just heard … 0=stale
+                    jitter -= bias * range * 0.8                          // up to 80% sooner
+                }
+                jitter = Math.max(MESH_JITTER_FLOOR, jitter)
                 const timer = setTimeout(() => {
                     pendingForwards.delete(id)
                     const newPath = (path ? path + ',' : '') + conf.callsign
