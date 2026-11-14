@@ -147,6 +147,8 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     let beaconGrid = ''
     // Slice 5: adaptive beacon scheduling.
     let beaconBaseMin = 15                 // operator's chosen interval (the base)
+    let beaconGpsTime = false              // Slice 7: GUI has a GPS fix → use slotting
+    const SLOT_WIDTH_MS = 5000             // one beacon's slot in the shared cycle
     const BEACON_WARMUP_MS = 8000          // listen this long before the first beacon
     const BEACON_WARMUP_SPREAD = 20000     // + callsign-derived 0-20s so joiners spread
     const BEACON_TARGET_DENSITY = 8        // stations before we slow down
@@ -164,6 +166,20 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         let ms = base * Math.max(1, n / BEACON_TARGET_DENSITY)  // slow down as N grows
         ms = Math.min(Math.max(ms, 5 * 60000), 60 * 60000)      // clamp 5-60 min
         return ms * (0.9 + 0.2 * Math.random())                 // ±10% so we don't lock-step
+    }
+    // Slice 7: GPS-time slotting. With a GPS-disciplined clock, all stations
+    // align to a shared cycle (= the base interval, anchored to UTC) and each
+    // takes a deterministic slot by callsign hash → beacons almost never
+    // overlap. Returns ms until this station's next slot.
+    const beaconSlotDelayMs = (): number => {
+        const cycleMs = Math.max(5, beaconBaseMin) * 60000
+        const numSlots = Math.max(1, Math.floor(cycleMs / SLOT_WIDTH_MS))
+        const slotOffset = (beaconPhase() % numSlots) * SLOT_WIDTH_MS
+        const now = Date.now()                                  // assumed GPS-accurate UTC
+        const cycleStart = Math.floor(now / cycleMs) * cycleMs
+        let t = cycleStart + slotOffset
+        if (t <= now + 500) t += cycleMs                        // slot already passed → next cycle
+        return t - now
     }
     const sendBeacon = async () => {
         try {
@@ -188,7 +204,8 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         if (beaconTimer) clearTimeout(beaconTimer)
         beaconTimer = setTimeout(() => {
             sendBeacon()
-            scheduleBeacon(beaconIntervalMs())   // reschedule at the current adaptive rate
+            // GPS stations re-slot; others use the adaptive rate.
+            scheduleBeacon(beaconGpsTime ? beaconSlotDelayMs() : beaconIntervalMs())
         }, delayMs)
     }
 
@@ -584,11 +601,14 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
                 if (typeof cmd.text === 'string') beaconText = cmd.text
                 if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
                 beaconBaseMin = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
+                beaconGpsTime = cmd.gpsTime === true
                 if (beaconTimer) clearTimeout(beaconTimer)
-                // Listen-before-beacon: don't TX immediately. Warm up (spread by
-                // callsign so joiners don't collide), then self-reschedule at
-                // the load-adaptive interval.
-                scheduleBeacon(BEACON_WARMUP_MS + (beaconPhase() % BEACON_WARMUP_SPREAD))
+                // With GPS: first beacon at our aligned slot. Without: listen-
+                // before-beacon warm-up (spread by callsign so joiners don't
+                // collide), then self-reschedule at the load-adaptive interval.
+                scheduleBeacon(beaconGpsTime
+                    ? beaconSlotDelayMs()
+                    : BEACON_WARMUP_MS + (beaconPhase() % BEACON_WARMUP_SPREAD))
             } else if (cmd.action === 'stop') {
                 if (beaconTimer) { clearTimeout(beaconTimer); beaconTimer = null }
             } else if (cmd.action === 'once') {
