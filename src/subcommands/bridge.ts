@@ -142,9 +142,29 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     // comment with no grid/neighbors).
     const BEACON_ADDR = 'BEACON'
     const BCN_PREFIX  = '\x01B1\x01'
-    let beaconTimer: ReturnType<typeof setInterval> | null = null
+    let beaconTimer: ReturnType<typeof setTimeout> | null = null
     let beaconText = 'QRV'
     let beaconGrid = ''
+    // Slice 5: adaptive beacon scheduling.
+    let beaconBaseMin = 15                 // operator's chosen interval (the base)
+    const BEACON_WARMUP_MS = 8000          // listen this long before the first beacon
+    const BEACON_WARMUP_SPREAD = 20000     // + callsign-derived 0-20s so joiners spread
+    const BEACON_TARGET_DENSITY = 8        // stations before we slow down
+    const beaconPhase = () => {            // deterministic per-callsign offset
+        let h = 0
+        for (let i = 0; i < conf.callsign.length; i++)
+            h = (Math.imul(h, 31) + conf.callsign.charCodeAt(i)) >>> 0
+        return h
+    }
+    const beaconIntervalMs = (): number => {
+        const now = Date.now()
+        let n = 0
+        for (const t of heard.values()) if (now - t <= HEARD_WINDOW_S * 1000) n++
+        const base = Math.max(1, beaconBaseMin) * 60000
+        let ms = base * Math.max(1, n / BEACON_TARGET_DENSITY)  // slow down as N grows
+        ms = Math.min(Math.max(ms, 5 * 60000), 60 * 60000)      // clamp 5-60 min
+        return ms * (0.9 + 0.2 * Math.random())                 // ±10% so we don't lock-step
+    }
     const sendBeacon = async () => {
         try {
             const now = Date.now()
@@ -163,6 +183,13 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             emit({ type: 'error',
                    error: `beacon failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
         }
+    }
+    const scheduleBeacon = (delayMs: number) => {
+        if (beaconTimer) clearTimeout(beaconTimer)
+        beaconTimer = setTimeout(() => {
+            sendBeacon()
+            scheduleBeacon(beaconIntervalMs())   // reschedule at the current adaptive rate
+        }, delayMs)
     }
 
     // Mail: a store-and-forward message (subject + body) to one callsign. It
@@ -544,12 +571,14 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             if (cmd.action === 'start') {
                 if (typeof cmd.text === 'string') beaconText = cmd.text
                 if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
-                const mins = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
-                if (beaconTimer) clearInterval(beaconTimer)
-                sendBeacon()                                   // beacon once now
-                beaconTimer = setInterval(sendBeacon, mins * 60 * 1000)
+                beaconBaseMin = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
+                if (beaconTimer) clearTimeout(beaconTimer)
+                // Listen-before-beacon: don't TX immediately. Warm up (spread by
+                // callsign so joiners don't collide), then self-reschedule at
+                // the load-adaptive interval.
+                scheduleBeacon(BEACON_WARMUP_MS + (beaconPhase() % BEACON_WARMUP_SPREAD))
             } else if (cmd.action === 'stop') {
-                if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null }
+                if (beaconTimer) { clearTimeout(beaconTimer); beaconTimer = null }
             } else if (cmd.action === 'once') {
                 if (typeof cmd.text === 'string') beaconText = cmd.text
                 if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
