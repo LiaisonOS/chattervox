@@ -47,6 +47,16 @@ import * as readline from 'readline'
 // and AUTO-ACKs on receipt with \x01MACK\x01<id> -> sender gets a `mail-ack`
 // event ({from,id,ts}). Duplicate ids are de-duped (filed once) but re-acked.
 //
+// PATHFINDER (Tier 1): relay discovery + app-level relay.
+//   GUI->bridge: {"type":"pathfinder","target":"VE2XYZ"}            (broadcast PFQ)
+//                {"type":"relay","via":"VA2GWM","target":"VE2XYZ","text":"..."}
+//   bridge->GUI: {"type":"pathfinder-sent","qid","target","ts"}
+//                {"type":"pathfinder-reply","from","qid","target","ageSec","ts"}
+//                {"type":"relay-sent","via","target","ts"}          (we asked a relay)
+//                {"type":"relayed-out","origin","target","ts"}      (we relayed for someone)
+//                {"type":"relayed-msg","origin","via","text","verification","ts"}
+// A station answers a PFQ only if it is the target or has heard it < 30 min.
+//
 
 function emit(obj: any): void {
     // One compact JSON object per line. stdout to a pipe is line-safe.
@@ -104,6 +114,21 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const MAIL_BODY_MAX = 500
     const seenMailIds: Set<string> = new Set<string>()   // de-dup filed mail
 
+    // Pathfinder (Tier 1): reactive relay discovery + app-level relay.
+    //   PFQ  \x01PFQ\x01<qid>\x01<target>           broadcast to "PATH"
+    //   PFR  \x01PFR\x01<qid>\x01<target>\x01<ageS> reply to the querier
+    //   RLY  \x01RLY\x01<target>\x01<text>          A -> chosen relay R
+    //   RMSG \x01RMSG\x01<origin>\x01<text>          R -> target Z (origin preserved)
+    const PATH_ADDR   = 'PATH'
+    const PFQ_PREFIX  = '\x01PFQ\x01'
+    const PFR_PREFIX  = '\x01PFR\x01'
+    const RLY_PREFIX  = '\x01RLY\x01'
+    const RMSG_PREFIX = '\x01RMSG\x01'
+    const HEARD_WINDOW_S = 30 * 60   // consider a station "reachable" if heard < 30 min
+    const heard: Map<string, number> = new Map<string, number>()  // callsign -> last-heard ms
+    const isMe = (st: { callsign: string, ssid: number }) =>
+        st.callsign === conf.callsign && st.ssid === conf.ssid
+
     // Classify an incoming/outgoing station pair into a channel + kind.
     //  - addressed to us  -> DM, channel = the other station
     //  - otherwise        -> room, channel = the destination name
@@ -126,6 +151,61 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
 
     messenger.on('message', (message: MessageEvent) => {
         const fromStr = stationToCallsignSSID(message.from)
+        // Every received frame proves we can hear `from` right now.
+        heard.set(message.from.callsign, Date.now())
+
+        // Pathfinder query: "who can hear <target>?" (broadcast to PATH).
+        if (message.to.callsign === PATH_ADDR && message.message.startsWith(PFQ_PREFIX)) {
+            const rest = message.message.slice(PFQ_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const qid = i1 >= 0 ? rest.slice(0, i1) : ''
+            const target = (i1 >= 0 ? rest.slice(i1 + 1) : '').toUpperCase()
+            // Answer if WE are the target (reachable directly) or we've heard it.
+            let ageS = -1
+            if (target === conf.callsign) ageS = 0
+            else if (heard.has(target)) {
+                const a = Math.round((Date.now() - (heard.get(target) as number)) / 1000)
+                if (a <= HEARD_WINDOW_S) ageS = a
+            }
+            if (ageS >= 0 && qid) {
+                messenger.send(fromStr, `${PFR_PREFIX}${qid}\x01${target}\x01${ageS}`, signDefault)
+                         .catch(() => {})
+            }
+            return
+        }
+        // Pathfinder reply addressed to us.
+        if (message.message.startsWith(PFR_PREFIX) && isMe(message.to)) {
+            const p = message.message.slice(PFR_PREFIX.length).split('\x01')
+            emit({ type: 'pathfinder-reply', from: fromStr,
+                   qid: p[0] || '', target: (p[1] || ''),
+                   ageSec: parseInt(p[2] || '0', 10) || 0, ts: Date.now() })
+            return
+        }
+        // Relay request addressed to us: forward the text to <target>, keeping
+        // the original sender's identity (origin = whoever sent us the RLY).
+        if (message.message.startsWith(RLY_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RLY_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const target = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : ''
+            if (target && text) {
+                messenger.send(target, `${RMSG_PREFIX}${fromStr}\x01${text}`, signDefault)
+                         .catch(() => {})
+                emit({ type: 'relayed-out', origin: fromStr, target, ts: Date.now() })
+            }
+            return
+        }
+        // A relayed message delivered to us (via some relay station).
+        if (message.message.startsWith(RMSG_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RMSG_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const origin = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : rest
+            emit({ type: 'relayed-msg', origin, via: fromStr, text,
+                   verification: Verification[message.verification], ts: Date.now() })
+            return
+        }
+
         // Mail? Structured id+subject+body — file into the Inbox, never a chat
         // tab. Only mail addressed to US (not overheard mail for others).
         if (message.message.startsWith(MAIL_PREFIX)) {
@@ -257,6 +337,38 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             } catch (err) {
                 emit({ type: 'error',
                        error: `mail failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'pathfinder') {
+            // Broadcast "who can hear <target>?" to the PATH address.
+            const target = String(cmd.target || '').trim().toUpperCase()
+            if (!isCallsign(target.split('-')[0])) {
+                emit({ type: 'error', error: `pathfinder: invalid target "${cmd.target}"` })
+                return
+            }
+            const qid = Math.random().toString(36).slice(2, 7)
+            emit({ type: 'pathfinder-sent', qid, target, ts: Date.now() })
+            try {
+                await messenger.send(PATH_ADDR, `${PFQ_PREFIX}${qid}\x01${target}`, signDefault)
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `pathfinder failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'relay') {
+            // Send <text> to <target> via relay station <via>.
+            const via = String(cmd.via || '').trim()
+            const target = String(cmd.target || '').trim().toUpperCase()
+            const text = String(cmd.text || '')
+            if (!via || !target || !text) {
+                emit({ type: 'error', error: 'relay: need via, target and text' }); return
+            }
+            try {
+                await messenger.send(via, `${RLY_PREFIX}${target}\x01${text}`, signDefault)
+                emit({ type: 'relay-sent', via, target, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `relay failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
             }
         }
         else if (cmd.type === 'beacon') {
