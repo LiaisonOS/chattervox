@@ -88,16 +88,36 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const joined: Set<string> = new Set<string>(['CQ'])
     const roomList = (): string[] => Array.from(joined)
 
-    // Presence beacons. Beacons are broadcast to the dedicated AX.25 address
-    // "BEACON"; we always listen for them (regardless of joined rooms) and feed
-    // them to the GUI's Stations-on-Air roster instead of a chat tab.
+    // Who we can hear right now (direct neighbors), from every received frame.
+    // Declared here because beacons advertise it (Tier 2 topology) and
+    // Pathfinder answers from it (Tier 1). callsign -> last-heard ms.
+    const heard: Map<string, number> = new Map<string, number>()
+    const HEARD_WINDOW_S = 30 * 60   // "reachable" if heard within this window
+
+    // Presence beacons (Tier 2: structured). Broadcast to the "BEACON" address:
+    //   \x01B1\x01<grid>\x01<comment>\x01<neighbor1,neighbor2,...>
+    // We always listen for them and feed the Stations-on-Air roster + the
+    // who-hears-whom topology map. Legacy plain-text beacons still parse (as a
+    // comment with no grid/neighbors).
     const BEACON_ADDR = 'BEACON'
+    const BCN_PREFIX  = '\x01B1\x01'
     let beaconTimer: ReturnType<typeof setInterval> | null = null
     let beaconText = 'QRV'
+    let beaconGrid = ''
     const sendBeacon = async () => {
         try {
-            await messenger.send(BEACON_ADDR, beaconText || 'QRV', signDefault)
-            emit({ type: 'beacon-sent', text: beaconText || 'QRV', ts: Date.now() })
+            const now = Date.now()
+            // Advertise up to 8 most-recently-heard neighbors (airtime budget).
+            const neigh = Array.from(heard.entries())
+                .filter(([c, t]) => c !== conf.callsign && (now - t) <= HEARD_WINDOW_S * 1000)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8)
+                .map(([c]) => c)
+            const comment = (beaconText || 'QRV').replace(/[\x00-\x08\x0e-\x1f]/g, ' ')
+            const grid = beaconGrid.replace(/[\x00-\x1f,]/g, '')
+            const payload = `${BCN_PREFIX}${grid}\x01${comment}\x01${neigh.join(',')}`
+            await messenger.send(BEACON_ADDR, payload, signDefault)
+            emit({ type: 'beacon-sent', text: comment, grid, neighbors: neigh, ts: now })
         } catch (err) {
             emit({ type: 'error',
                    error: `beacon failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
@@ -124,8 +144,6 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const PFR_PREFIX  = '\x01PFR\x01'
     const RLY_PREFIX  = '\x01RLY\x01'
     const RMSG_PREFIX = '\x01RMSG\x01'
-    const HEARD_WINDOW_S = 30 * 60   // consider a station "reachable" if heard < 30 min
-    const heard: Map<string, number> = new Map<string, number>()  // callsign -> last-heard ms
     const isMe = (st: { callsign: string, ssid: number }) =>
         st.callsign === conf.callsign && st.ssid === conf.ssid
 
@@ -241,12 +259,19 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             emit({ type: 'mail-ack', from: fromStr, id, ts: Date.now() })
             return
         }
-        // Presence beacon? Feed the roster, never a chat tab. Always surfaced.
+        // Presence beacon? Feed the roster + topology, never a chat tab.
         if (message.to.callsign === BEACON_ADDR) {
+            let grid = '', text = message.message, neighbors: string[] = []
+            if (message.message.startsWith(BCN_PREFIX)) {
+                const p = message.message.slice(BCN_PREFIX.length).split('\x01')
+                grid = p[0] || ''
+                text = p[1] || ''
+                neighbors = (p[2] || '').split(',').map(s => s.trim()).filter(s => s.length > 0)
+            }
             emit({
                 type: 'beacon',
                 from: fromStr,
-                text: message.message,
+                grid, text, neighbors,
                 verification: Verification[message.verification],
                 ts: Date.now()
             })
@@ -374,6 +399,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         else if (cmd.type === 'beacon') {
             if (cmd.action === 'start') {
                 if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
                 const mins = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
                 if (beaconTimer) clearInterval(beaconTimer)
                 sendBeacon()                                   // beacon once now
@@ -382,6 +408,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
                 if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null }
             } else if (cmd.action === 'once') {
                 if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
                 sendBeacon()
             }
         }
