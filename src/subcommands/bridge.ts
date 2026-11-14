@@ -38,12 +38,14 @@ import * as readline from 'readline'
 //   {"type":"beacon","action":"start","intervalMin":15,"text":"QRV Montreal"}
 //   {"type":"beacon","action":"stop"}
 //   {"type":"beacon","action":"once","text":"QRV"}       // send one beacon now
-//   {"type":"mail","to":"VA2GWM","subject":"Sked","body":"meet 1900Z 40m"}
+//   {"type":"mail","to":"VA2GWM","id":"k3f9a","subject":"Sked","body":"meet 1900Z 40m"}
 //
 // Beacons broadcast to the AX.25 address "BEACON"; the bridge always listens
 // for it and emits a `beacon` event (never a chat message) for the roster.
-// Mail carries a \x01MAIL\x01 sentinel; the bridge emits it as a `mail` event
-// ({from,to,subject,body,verification,ts}) + a `mail-sent` echo on send.
+// Mail carries a \x01MAIL\x01<id>\x01<subj>\x01<body> sentinel; the bridge files
+// it (addressed-to-us only), emits a `mail` event + a `mail-sent` echo on send,
+// and AUTO-ACKs on receipt with \x01MACK\x01<id> -> sender gets a `mail-ack`
+// event ({from,id,ts}). Duplicate ids are de-duped (filed once) but re-acked.
 //
 
 function emit(obj: any): void {
@@ -96,9 +98,11 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     // rides the same transport as chat but carries a control-char sentinel the
     // chat UI can never produce, so the receiver files it into the Inbox rather
     // than a chat tab. Format: \x01MAIL\x01<subject>\x01<body>
-    const MAIL_PREFIX = '\x01MAIL\x01'
+    const MAIL_PREFIX = '\x01MAIL\x01'   // \x01MAIL\x01<id>\x01<subject>\x01<body>
+    const MACK_PREFIX = '\x01MACK\x01'   // \x01MACK\x01<id>  (ack on receipt)
     const MAIL_SUBJ_MAX = 60
     const MAIL_BODY_MAX = 500
+    const seenMailIds: Set<string> = new Set<string>()   // de-dup filed mail
 
     // Classify an incoming/outgoing station pair into a channel + kind.
     //  - addressed to us  -> DM, channel = the other station
@@ -122,20 +126,39 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
 
     messenger.on('message', (message: MessageEvent) => {
         const fromStr = stationToCallsignSSID(message.from)
-        // Mail? Structured subject+body — file into the Inbox, never a chat tab.
+        // Mail? Structured id+subject+body — file into the Inbox, never a chat
+        // tab. Only mail addressed to US (not overheard mail for others).
         if (message.message.startsWith(MAIL_PREFIX)) {
+            if (!(message.to.callsign === conf.callsign && message.to.ssid === conf.ssid))
+                return
             const rest = message.message.slice(MAIL_PREFIX.length)
-            const idx = rest.indexOf('\x01')
-            const subject = idx >= 0 ? rest.slice(0, idx) : ''
-            const body = idx >= 0 ? rest.slice(idx + 1) : rest
+            const i1 = rest.indexOf('\x01')
+            const i2 = i1 >= 0 ? rest.indexOf('\x01', i1 + 1) : -1
+            const id = i1 >= 0 ? rest.slice(0, i1) : ''
+            const subject = (i1 >= 0 && i2 >= 0) ? rest.slice(i1 + 1, i2) : ''
+            const body = i2 >= 0 ? rest.slice(i2 + 1)
+                        : (i1 >= 0 ? rest.slice(i1 + 1) : rest)
+            // Auto-ack on receipt — ALWAYS (even a duplicate: the sender retried
+            // because our earlier ack was lost). Fire-and-forget.
+            if (id)
+                messenger.send(fromStr, MACK_PREFIX + id, signDefault).catch(() => {})
+            // De-dup filing: don't file the same mail twice.
+            if (id && seenMailIds.has(id)) return
+            if (id) seenMailIds.add(id)
             emit({
                 type: 'mail',
                 from: fromStr,
                 to: stationToCallsignSSID(message.to),
-                subject, body,
+                id, subject, body,
                 verification: Verification[message.verification],
                 ts: Date.now()
             })
+            return
+        }
+        // Mail acknowledgement from a station we sent mail to.
+        if (message.message.startsWith(MACK_PREFIX)) {
+            const id = message.message.slice(MACK_PREFIX.length)
+            emit({ type: 'mail-ack', from: fromStr, id, ts: Date.now() })
             return
         }
         // Presence beacon? Feed the roster, never a chat tab. Always surfaced.
@@ -221,15 +244,16 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         }
         else if (cmd.type === 'mail') {
             const to = String(cmd.to || '').trim()
-            // Subject must not contain the \x01 delimiter; clamp both fields.
+            // id + subject must not contain the \x01 delimiter; clamp fields.
+            const id = String(cmd.id || '').replace(/[\x00-\x1f]/g, '').slice(0, 12)
             const subject = String(cmd.subject || '')
                 .replace(/[\x00-\x08\x0e-\x1f]/g, ' ').slice(0, MAIL_SUBJ_MAX)
             const body = String(cmd.body || '').slice(0, MAIL_BODY_MAX)
             if (!to) { emit({ type: 'error', error: 'mail: missing recipient' }); return }
-            const payload = MAIL_PREFIX + subject + '\x01' + body
+            const payload = MAIL_PREFIX + id + '\x01' + subject + '\x01' + body
             try {
                 await messenger.send(to, payload, signDefault)
-                emit({ type: 'mail-sent', to, subject, ts: Date.now() })
+                emit({ type: 'mail-sent', to, id, subject, ts: Date.now() })
             } catch (err) {
                 emit({ type: 'error',
                        error: `mail failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
