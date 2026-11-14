@@ -1,0 +1,627 @@
+import { Config } from '../config'
+import { Keystore } from '../Keystore'
+import { Messenger, MessageEvent, Verification } from '../Messenger'
+import { stationToCallsignSSID, isCallsign } from '../utils'
+import * as readline from 'readline'
+
+//
+// bridge — a headless JSON-lines adapter around Messenger so a GUI front-end
+// (QtChattervox) can drive chattervox over stdin/stdout. It reuses the exact
+// same engine as `chat` (KISS, AX.25, deflate, signing/verification), so a
+// GUI built on it interoperates with every other chattervox station on air.
+//
+// Protocol: one JSON object per line, UTF-8, '\n'-terminated.
+//
+// CHANNELS: chattervox addresses by a 1-6 char alphanumeric name in the AX.25
+// destination field. "CQ" is the default room; any other name (EMCOMM, EOC,
+// NET1 …) is a chat room. A message addressed directly to our callsign is a
+// DM. Every rx/tx carries a `channel` tag so the GUI can route it to a pane:
+//   - room message  -> channel = the room name ("CQ", "EMCOMM", …)
+//   - direct to us   -> channel = the OTHER station's callsign-ssid (a DM)
+// We only surface rooms the GUI has joined (CQ is always joined), plus DMs.
+//
+// Bridge -> GUI (stdout):
+//   {"type":"ready","callsign":"VA2OPS","ssid":0,"signing":true,"rooms":["CQ"]}
+//   {"type":"status","state":"open"|"close"|"tnc-error","error"?:"..."}
+//   {"type":"rooms","rooms":["CQ","EMCOMM"]}              // after join/leave
+//   {"type":"rx","from":"VA2XYZ-1","to":"CQ","channel":"CQ","kind":"room",
+//                "message":"hi","verification":"Valid","ts":...}
+//   {"type":"tx","to":"CQ","channel":"CQ","kind":"room","message":"hello","ts":...}
+//   {"type":"beacon","from":"VA2GWM","text":"QRV Montreal","verification":"Valid","ts":...}
+//   {"type":"beacon-sent","text":"QRV","ts":...}         // our own beacon went out
+//   {"type":"error","error":"..."}
+//
+// GUI -> Bridge (stdin):
+//   {"type":"tx","to":"CQ","text":"hello","sign":true}   // to/sign optional
+//   {"type":"join","room":"EMCOMM"}
+//   {"type":"leave","room":"EMCOMM"}
+//   {"type":"beacon","action":"start","intervalMin":15,"text":"QRV Montreal"}
+//   {"type":"beacon","action":"stop"}
+//   {"type":"beacon","action":"once","text":"QRV"}       // send one beacon now
+//   {"type":"mail","to":"VA2GWM","id":"k3f9a","subject":"Sked","body":"meet 1900Z 40m"}
+//
+// Beacons broadcast to the AX.25 address "BEACON"; the bridge always listens
+// for it and emits a `beacon` event (never a chat message) for the roster.
+// Mail carries a \x01MAIL\x01<id>\x01<subj>\x01<body> sentinel; the bridge files
+// it (addressed-to-us only), emits a `mail` event + a `mail-sent` echo on send,
+// and AUTO-ACKs on receipt with \x01MACK\x01<id> -> sender gets a `mail-ack`
+// event ({from,id,ts}). Duplicate ids are de-duped (filed once) but re-acked.
+//
+// PATHFINDER (Tier 1): relay discovery + app-level relay.
+//   GUI->bridge: {"type":"pathfinder","target":"VE2XYZ"}            (broadcast PFQ)
+//                {"type":"relay","via":"VA2GWM","target":"VE2XYZ","text":"..."}
+//   bridge->GUI: {"type":"pathfinder-sent","qid","target","ts"}
+//                {"type":"pathfinder-reply","from","qid","target","ageSec","ts"}
+//                {"type":"relay-sent","via","target","ts"}          (we asked a relay)
+//                {"type":"relayed-out","origin","target","ts"}      (we relayed for someone)
+//                {"type":"relayed-msg","origin","via","text","verification","ts"}
+// A station answers a PFQ only if it is the target or has heard it < 30 min.
+//
+// MESHCORE (Tier 3, Slice 1): routed multi-hop.
+//   GUI->bridge: {"type":"mesh","dest":"VE2XYZ","text":"..."}
+//   bridge->GUI: {"type":"mesh-sent","id","dest","ts"}
+//                {"type":"mesh-relayed","id","origin","dest","ts"}   (we forwarded)
+//                {"type":"mesh-relay-cancelled","id","by","ts"}      (someone beat us to it)
+//                {"type":"mesh-msg","origin","dest","text","path","via","verification","ts"}
+//                {"type":"mesh-ack","id","from","ts"}                (our send was delivered)
+// Delivery is auto-acked: the dest routes a MESH back to the origin whose inner
+// is MESH_ACK_PREFIX+<original id> → origin gets mesh-ack. Relays jitter + cancel
+// on overhear so only one forwards each frame (and each ack).
+// MESH frame \x01MESH\x01<id>\x01<ttl>\x01<origin>\x01<dest>\x01<path>\x01<inner>
+// is AX.25-addressed to <dest>; relays re-send (ttl--, +self to path) until it
+// reaches dest. Dedup by <id>, TTL hop limit, loop-path guard.
+//
+
+function emit(obj: any): void {
+    // One compact JSON object per line. stdout to a pipe is line-safe.
+    process.stdout.write(JSON.stringify(obj) + '\n')
+}
+
+export async function main(args: any, conf: Config, ks: Keystore): Promise<number> {
+
+    const messenger = new Messenger(conf, ks)
+
+    // Sign by default ONLY when config.signingKey actually matches a keypair in
+    // the keystore for the CURRENT callsign. After a station rename the old key
+    // won't match — degrade to unsigned instead of crashing, and warn the GUI.
+    let signDefault = false
+    let signingWarning = ''
+    if (typeof conf.signingKey === 'string' && conf.signingKey.length > 0) {
+        let hasKey = false
+        try {
+            hasKey = ks.getKeyPairs(conf.callsign)
+                       .some((k: any) => k.public === conf.signingKey)
+        } catch (e) { hasKey = false }
+        if (hasKey) signDefault = true
+        else signingWarning = `No signing key for ${conf.callsign} in the keystore — sending UNSIGNED. ` +
+                              `Run "chattervox genkey" (or restart the Chattervox mode) to create one.`
+    }
+
+    // Rooms we're listening to. CQ is always joined. Names are upper-cased and
+    // validated against the AX.25 callsign rule (1-6 alphanumeric chars).
+    const joined: Set<string> = new Set<string>(['CQ'])
+    const roomList = (): string[] => Array.from(joined)
+
+    // Who we can hear right now (direct neighbors), from every received frame.
+    // Declared here because beacons advertise it (Tier 2 topology) and
+    // Pathfinder answers from it (Tier 1). callsign -> last-heard ms.
+    const heard: Map<string, number> = new Map<string, number>()
+    const HEARD_WINDOW_S = 30 * 60   // "reachable" if heard within this window
+
+    // Slice 4: TX pacing — channel courtesy + our own airtime budget. Applies to
+    // AUTOMATED traffic (beacons, mesh relays/acks, mesh originations), NOT to
+    // the operator's own chat/DM/mail (those go promptly; the TNC's carrier
+    // sense handles them). Emergency (urgent) bypasses both gates.
+    let lastHeardTs = 0                       // when we last decoded any frame
+    const QUIET_GAP_MS = 2000                 // wait for this much silence first
+    const MAX_DEFER_MS = 8000                 // …but never starve a frame past this
+    let txTokens = 6                          // token bucket (burst)
+    const TX_CAPACITY = 6
+    const TX_REFILL_MS = 10000                // +1 token / 10 s → ~6/min sustained
+    setInterval(() => { if (txTokens < TX_CAPACITY) txTokens++ }, TX_REFILL_MS)
+    const sendPaced = (dest: string, payload: string, urgent = false): void => {
+        const deadline = Date.now() + MAX_DEFER_MS
+        const attempt = () => {
+            const now = Date.now()
+            const forced = now >= deadline
+            const quiet = (now - lastHeardTs) >= QUIET_GAP_MS
+            if (urgent || forced || (quiet && txTokens > 0)) {
+                if (!urgent && txTokens > 0) txTokens--
+                messenger.send(dest, payload, signDefault).catch(() => {})
+                return
+            }
+            setTimeout(attempt, 300)          // channel busy or out of budget → wait
+        }
+        attempt()
+    }
+
+    // Presence beacons (Tier 2: structured). Broadcast to the "BEACON" address:
+    //   \x01B1\x01<grid>\x01<comment>\x01<neighbor1,neighbor2,...>
+    // We always listen for them and feed the Stations-on-Air roster + the
+    // who-hears-whom topology map. Legacy plain-text beacons still parse (as a
+    // comment with no grid/neighbors).
+    const BEACON_ADDR = 'BEACON'
+    const BCN_PREFIX  = '\x01B1\x01'
+    let beaconTimer: ReturnType<typeof setTimeout> | null = null
+    let beaconText = 'QRV'
+    let beaconGrid = ''
+    // Slice 5: adaptive beacon scheduling.
+    let beaconBaseMin = 15                 // operator's chosen interval (the base)
+    let beaconGpsTime = false              // Slice 7: GUI has a GPS fix → use slotting
+    const SLOT_WIDTH_MS = 5000             // one beacon's slot in the shared cycle
+    const BEACON_WARMUP_MS = 8000          // listen this long before the first beacon
+    const BEACON_WARMUP_SPREAD = 20000     // + callsign-derived 0-20s so joiners spread
+    const BEACON_TARGET_DENSITY = 8        // stations before we slow down
+    const beaconPhase = () => {            // deterministic per-callsign offset
+        let h = 0
+        for (let i = 0; i < conf.callsign.length; i++)
+            h = (Math.imul(h, 31) + conf.callsign.charCodeAt(i)) >>> 0
+        return h
+    }
+    const beaconIntervalMs = (): number => {
+        const now = Date.now()
+        let n = 0
+        for (const t of heard.values()) if (now - t <= HEARD_WINDOW_S * 1000) n++
+        const base = Math.max(1, beaconBaseMin) * 60000
+        let ms = base * Math.max(1, n / BEACON_TARGET_DENSITY)  // slow down as N grows
+        ms = Math.min(Math.max(ms, 5 * 60000), 60 * 60000)      // clamp 5-60 min
+        return ms * (0.9 + 0.2 * Math.random())                 // ±10% so we don't lock-step
+    }
+    // Slice 7: GPS-time slotting. With a GPS-disciplined clock, all stations
+    // align to a shared cycle (= the base interval, anchored to UTC) and each
+    // takes a deterministic slot by callsign hash → beacons almost never
+    // overlap. Returns ms until this station's next slot.
+    const beaconSlotDelayMs = (): number => {
+        const cycleMs = Math.max(5, beaconBaseMin) * 60000
+        const numSlots = Math.max(1, Math.floor(cycleMs / SLOT_WIDTH_MS))
+        const slotOffset = (beaconPhase() % numSlots) * SLOT_WIDTH_MS
+        const now = Date.now()                                  // assumed GPS-accurate UTC
+        const cycleStart = Math.floor(now / cycleMs) * cycleMs
+        let t = cycleStart + slotOffset
+        if (t <= now + 500) t += cycleMs                        // slot already passed → next cycle
+        return t - now
+    }
+    const sendBeacon = async () => {
+        try {
+            const now = Date.now()
+            // Advertise up to 8 most-recently-heard neighbors (airtime budget).
+            const neigh = Array.from(heard.entries())
+                .filter(([c, t]) => c !== conf.callsign && (now - t) <= HEARD_WINDOW_S * 1000)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8)
+                .map(([c]) => c)
+            const comment = (beaconText || 'QRV').replace(/[\x00-\x08\x0e-\x1f]/g, ' ')
+            const grid = beaconGrid.replace(/[\x00-\x1f,]/g, '')
+            const payload = `${BCN_PREFIX}${grid}\x01${comment}\x01${neigh.join(',')}`
+            sendPaced(BEACON_ADDR, payload, false)   // paced: beacons defer to live traffic
+            emit({ type: 'beacon-sent', text: comment, grid, neighbors: neigh, ts: now })
+        } catch (err) {
+            emit({ type: 'error',
+                   error: `beacon failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+        }
+    }
+    const scheduleBeacon = (delayMs: number) => {
+        if (beaconTimer) clearTimeout(beaconTimer)
+        beaconTimer = setTimeout(() => {
+            sendBeacon()
+            // GPS stations re-slot; others use the adaptive rate.
+            scheduleBeacon(beaconGpsTime ? beaconSlotDelayMs() : beaconIntervalMs())
+        }, delayMs)
+    }
+
+    // Mail: a store-and-forward message (subject + body) to one callsign. It
+    // rides the same transport as chat but carries a control-char sentinel the
+    // chat UI can never produce, so the receiver files it into the Inbox rather
+    // than a chat tab. Format: \x01MAIL\x01<subject>\x01<body>
+    const MAIL_PREFIX = '\x01MAIL\x01'   // \x01MAIL\x01<id>\x01<subject>\x01<body>
+    const MACK_PREFIX = '\x01MACK\x01'   // \x01MACK\x01<id>  (ack on receipt)
+    const MAIL_SUBJ_MAX = 60
+    const MAIL_BODY_MAX = 500
+    const seenMailIds: Set<string> = new Set<string>()   // de-dup filed mail
+
+    // Pathfinder (Tier 1): reactive relay discovery + app-level relay.
+    //   PFQ  \x01PFQ\x01<qid>\x01<target>           broadcast to "PATH"
+    //   PFR  \x01PFR\x01<qid>\x01<target>\x01<ageS> reply to the querier
+    //   RLY  \x01RLY\x01<target>\x01<text>          A -> chosen relay R
+    //   RMSG \x01RMSG\x01<origin>\x01<text>          R -> target Z (origin preserved)
+    const PATH_ADDR   = 'PATH'
+    const PFQ_PREFIX  = '\x01PFQ\x01'
+    const PFR_PREFIX  = '\x01PFR\x01'
+    const RLY_PREFIX  = '\x01RLY\x01'
+    const RMSG_PREFIX = '\x01RMSG\x01'
+
+    // Tier 3 meshcore (Slice 1): routed multi-hop with dedup + TTL.
+    //   MESH  \x01MESH\x01<id>\x01<ttl>\x01<prio>\x01<origin>\x01<dest>\x01<path>\x01<inner>
+    // Addressed (AX.25) to the final <dest>; relays re-transmit it (ttl--, add
+    // self to path) until it reaches dest, which delivers. Dedup by <id>.
+    // <prio> "1" = urgent (Emergency): bypasses TX pacing end-to-end.
+    const MESH_PREFIX = '\x01MESH\x01'
+    // Slice 3: a delivery ack is just a MESH message back to the origin whose
+    // inner payload is this marker + the original mesh-id — so it reuses all the
+    // routing/jitter/cancellation. (\x02 so it can't look like chat text.)
+    const MESH_ACK_PREFIX = '\x02MACK\x02'
+    const MESH_MAX_HOPS = 2
+    const MESH_JITTER_MIN = 500       // ms — random relay backoff window
+    const MESH_JITTER_MAX = 3000
+    const MESH_JITTER_FLOOR = 300     // never beat the TNC's own timing (Slice 6)
+    const seenMeshIds: Set<string> = new Set<string>()
+    // Slice 2: relays we've SCHEDULED but not yet sent (id -> timer). If we hear
+    // another station relay the same id first, we cancel ours (overhear-cancel).
+    const pendingForwards: Map<string, ReturnType<typeof setTimeout>> = new Map()
+    const noteMeshId = (id: string) => {
+        seenMeshIds.add(id)
+        if (seenMeshIds.size > 1000) seenMeshIds.clear()   // crude bound
+    }
+    const buildMesh = (id: string, ttl: number, prio: string, origin: string,
+                       dest: string, path: string, inner: string) =>
+        MESH_PREFIX + [id, String(ttl), prio, origin, dest, path, inner].join('\x01')
+
+    const isMe = (st: { callsign: string, ssid: number }) =>
+        st.callsign === conf.callsign && st.ssid === conf.ssid
+
+    // Classify an incoming/outgoing station pair into a channel + kind.
+    //  - addressed to us  -> DM, channel = the other station
+    //  - otherwise        -> room, channel = the destination name
+    const classify = (to: { callsign: string, ssid: number },
+                      other: string): { channel: string, kind: string } => {
+        if (to.callsign === conf.callsign && to.ssid === conf.ssid)
+            return { channel: other, kind: 'dm' }
+        return { channel: to.callsign, kind: 'room' }
+    }
+
+    messenger.on('close', () => {
+        emit({ type: 'status', state: 'close' })
+        process.exit(1)
+    })
+
+    messenger.on('tnc-error', (err: any) => {
+        emit({ type: 'status', state: 'tnc-error',
+               error: String(err && err.message ? err.message : err) })
+    })
+
+    messenger.on('message', (message: MessageEvent) => {
+        const fromStr = stationToCallsignSSID(message.from)
+        // Every received frame proves we can hear `from` right now.
+        heard.set(message.from.callsign, Date.now())
+        lastHeardTs = Date.now()              // channel activity, for TX pacing
+
+        // Pathfinder query: "who can hear <target>?" (broadcast to PATH).
+        if (message.to.callsign === PATH_ADDR && message.message.startsWith(PFQ_PREFIX)) {
+            const rest = message.message.slice(PFQ_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const qid = i1 >= 0 ? rest.slice(0, i1) : ''
+            const target = (i1 >= 0 ? rest.slice(i1 + 1) : '').toUpperCase()
+            // Answer if WE are the target (reachable directly) or we've heard it.
+            let ageS = -1
+            if (target === conf.callsign) ageS = 0
+            else if (heard.has(target)) {
+                const a = Math.round((Date.now() - (heard.get(target) as number)) / 1000)
+                if (a <= HEARD_WINDOW_S) ageS = a
+            }
+            if (ageS >= 0 && qid) {
+                messenger.send(fromStr, `${PFR_PREFIX}${qid}\x01${target}\x01${ageS}`, signDefault)
+                         .catch(() => {})
+            }
+            return
+        }
+        // Pathfinder reply addressed to us.
+        if (message.message.startsWith(PFR_PREFIX) && isMe(message.to)) {
+            const p = message.message.slice(PFR_PREFIX.length).split('\x01')
+            emit({ type: 'pathfinder-reply', from: fromStr,
+                   qid: p[0] || '', target: (p[1] || ''),
+                   ageSec: parseInt(p[2] || '0', 10) || 0, ts: Date.now() })
+            return
+        }
+        // Relay request addressed to us: forward the text to <target>, keeping
+        // the original sender's identity (origin = whoever sent us the RLY).
+        if (message.message.startsWith(RLY_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RLY_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const target = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : ''
+            if (target && text) {
+                messenger.send(target, `${RMSG_PREFIX}${fromStr}\x01${text}`, signDefault)
+                         .catch(() => {})
+                emit({ type: 'relayed-out', origin: fromStr, target, ts: Date.now() })
+            }
+            return
+        }
+        // A relayed message delivered to us (via some relay station).
+        if (message.message.startsWith(RMSG_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RMSG_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const origin = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : rest
+            emit({ type: 'relayed-msg', origin, via: fromStr, text,
+                   verification: Verification[message.verification], ts: Date.now() })
+            return
+        }
+
+        // Mail? Structured id+subject+body — file into the Inbox, never a chat
+        // tab. Only mail addressed to US (not overheard mail for others).
+        if (message.message.startsWith(MAIL_PREFIX)) {
+            if (!(message.to.callsign === conf.callsign && message.to.ssid === conf.ssid))
+                return
+            const rest = message.message.slice(MAIL_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const i2 = i1 >= 0 ? rest.indexOf('\x01', i1 + 1) : -1
+            const id = i1 >= 0 ? rest.slice(0, i1) : ''
+            const subject = (i1 >= 0 && i2 >= 0) ? rest.slice(i1 + 1, i2) : ''
+            const body = i2 >= 0 ? rest.slice(i2 + 1)
+                        : (i1 >= 0 ? rest.slice(i1 + 1) : rest)
+            // Auto-ack on receipt — ALWAYS (even a duplicate: the sender retried
+            // because our earlier ack was lost). Fire-and-forget.
+            if (id)
+                messenger.send(fromStr, MACK_PREFIX + id, signDefault).catch(() => {})
+            // De-dup filing: don't file the same mail twice.
+            if (id && seenMailIds.has(id)) return
+            if (id) seenMailIds.add(id)
+            emit({
+                type: 'mail',
+                from: fromStr,
+                to: stationToCallsignSSID(message.to),
+                id, subject, body,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
+        // Mail acknowledgement from a station we sent mail to.
+        if (message.message.startsWith(MACK_PREFIX)) {
+            const id = message.message.slice(MACK_PREFIX.length)
+            emit({ type: 'mail-ack', from: fromStr, id, ts: Date.now() })
+            return
+        }
+        // Presence beacon? Feed the roster + topology, never a chat tab.
+        if (message.to.callsign === BEACON_ADDR) {
+            let grid = '', text = message.message, neighbors: string[] = []
+            if (message.message.startsWith(BCN_PREFIX)) {
+                const p = message.message.slice(BCN_PREFIX.length).split('\x01')
+                grid = p[0] || ''
+                text = p[1] || ''
+                neighbors = (p[2] || '').split(',').map(s => s.trim()).filter(s => s.length > 0)
+            }
+            emit({
+                type: 'beacon',
+                from: fromStr,
+                grid, text, neighbors,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
+        // Mesh frame? Deliver (if for us) or forward (if a relay). Checked for
+        // ANY frame (a relay sees frames addressed to the final dest, not it).
+        if (message.message.startsWith(MESH_PREFIX)) {
+            const p = message.message.slice(MESH_PREFIX.length).split('\x01')
+            const id = p[0] || ''
+            const ttl = parseInt(p[1] || '0', 10) || 0
+            const prio = p[2] || '0'
+            const origin = p[3] || ''
+            const dest = p[4] || ''
+            const path = p[5] || ''
+            const inner = p.slice(6).join('\x01')
+            const urgent = prio === '1'
+            if (!id) return
+            const relayedCopy = (fromStr !== origin)   // a relay (not the origin) transmitted it
+
+            // Overhear-cancellation: if we had this id scheduled to relay and we
+            // just heard ANOTHER station relay it, cancel ours — only one fires.
+            if (pendingForwards.has(id)) {
+                if (relayedCopy) {
+                    clearTimeout(pendingForwards.get(id) as ReturnType<typeof setTimeout>)
+                    pendingForwards.delete(id)
+                    emit({ type: 'mesh-relay-cancelled', id, by: fromStr, ts: Date.now() })
+                }
+                return                                 // already scheduled — ignore the duplicate
+            }
+            if (seenMeshIds.has(id)) return            // already handled (delivered/forwarded)
+            noteMeshId(id)
+
+            if (dest === conf.callsign) {              // delivered to us
+                if (inner.startsWith(MESH_ACK_PREFIX)) {
+                    // A routed delivery ack for one of OUR mesh sends.
+                    emit({ type: 'mesh-ack', id: inner.slice(MESH_ACK_PREFIX.length),
+                           from: origin, ts: Date.now() })
+                    return
+                }
+                emit({
+                    type: 'mesh-msg', origin, dest, text: inner, path,
+                    via: fromStr, verification: Verification[message.verification],
+                    ts: Date.now()
+                })
+                // Auto-ack on receipt: route a tiny ack back to the origin
+                // (same priority as the message it confirms).
+                const ackId = conf.callsign + '-a' + Math.random().toString(36).slice(2, 6)
+                noteMeshId(ackId)
+                sendPaced(origin, buildMesh(ackId, MESH_MAX_HOPS, prio, conf.callsign, origin,
+                                            '', MESH_ACK_PREFIX + id), urgent)
+                return
+            }
+            // Schedule a forward with random jitter; if another relay beats us to
+            // it (heard above), it gets cancelled before this fires.
+            const pathList = path ? path.split(',') : []
+            if (ttl > 0 && origin !== conf.callsign && !pathList.includes(conf.callsign)) {
+                // Weighted jitter (Slice 6): a relay that hears the DEST more
+                // recently is a better relay, so bias its delay shorter → it
+                // wins the overhear-cancellation race and the worse relays cancel.
+                const range = MESH_JITTER_MAX - MESH_JITTER_MIN
+                let jitter = MESH_JITTER_MIN + Math.random() * range
+                const destHeardTs = heard.get(dest.split('-')[0])
+                if (destHeardTs) {
+                    const ageS = (Date.now() - destHeardTs) / 1000
+                    const bias = Math.max(0, 1 - ageS / HEARD_WINDOW_S)   // 1=just heard … 0=stale
+                    jitter -= bias * range * 0.8                          // up to 80% sooner
+                }
+                jitter = Math.max(MESH_JITTER_FLOOR, jitter)
+                const timer = setTimeout(() => {
+                    pendingForwards.delete(id)
+                    const newPath = (path ? path + ',' : '') + conf.callsign
+                    sendPaced(dest, buildMesh(id, ttl - 1, prio, origin, dest, newPath, inner), urgent)
+                    emit({ type: 'mesh-relayed', id, origin, dest, ts: Date.now() })
+                }, jitter)
+                pendingForwards.set(id, timer)
+            }
+            return
+        }
+
+        const { channel, kind } = classify(message.to, fromStr)
+        // Show DMs to us, and rooms we've joined. Drop rooms we're not in.
+        if (kind !== 'dm' && !joined.has(channel)) return
+        emit({
+            type: 'rx',
+            from: fromStr,
+            to: stationToCallsignSSID(message.to),
+            channel,
+            kind,
+            message: message.message,
+            verification: Verification[message.verification], // enum -> name
+            ts: Date.now()
+        })
+    })
+
+    try {
+        await messenger.openTNC()
+    } catch (err) {
+        emit({ type: 'status', state: 'tnc-error',
+               error: `Could not open the KISS TNC at ${conf.kissPort}. Is the TNC running?` })
+        return 1
+    }
+
+    emit({ type: 'status', state: 'open' })
+    emit({ type: 'ready', callsign: conf.callsign, ssid: conf.ssid,
+           signing: signDefault, rooms: roomList() })
+    if (signingWarning) emit({ type: 'error', error: signingWarning })
+
+    // Read newline-delimited JSON commands from the GUI.
+    const rl = readline.createInterface({ input: process.stdin })
+    rl.on('line', async (line: string) => {
+        line = line.trim()
+        if (line === '') return
+        let cmd: any
+        try {
+            cmd = JSON.parse(line)
+        } catch (err) {
+            emit({ type: 'error', error: `bad JSON command: ${line}` })
+            return
+        }
+
+        if (cmd.type === 'tx') {
+            const to: string = (typeof cmd.to === 'string' && cmd.to.length > 0) ? cmd.to : 'CQ'
+            const text: string = typeof cmd.text === 'string' ? cmd.text : ''
+            const sign: boolean = typeof cmd.sign === 'boolean' ? cmd.sign : signDefault
+            if (text === '') return
+            try {
+                await messenger.send(to, text, sign)
+                const kind = (to === 'CQ' || joined.has(to.toUpperCase())) ? 'room' : 'dm'
+                emit({ type: 'tx', to, channel: to, kind, message: text, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `send failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'join') {
+            const room = String(cmd.room || '').toUpperCase()
+            if (!isCallsign(room)) {
+                emit({ type: 'error',
+                       error: `invalid room "${cmd.room}" — 1-6 letters/digits (AX.25 limit)` })
+                return
+            }
+            joined.add(room)
+            emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'leave') {
+            const room = String(cmd.room || '').toUpperCase()
+            if (room !== 'CQ') joined.delete(room)   // CQ can't be left
+            emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'mail') {
+            const to = String(cmd.to || '').trim()
+            // id + subject must not contain the \x01 delimiter; clamp fields.
+            const id = String(cmd.id || '').replace(/[\x00-\x1f]/g, '').slice(0, 12)
+            const subject = String(cmd.subject || '')
+                .replace(/[\x00-\x08\x0e-\x1f]/g, ' ').slice(0, MAIL_SUBJ_MAX)
+            const body = String(cmd.body || '').slice(0, MAIL_BODY_MAX)
+            if (!to) { emit({ type: 'error', error: 'mail: missing recipient' }); return }
+            const payload = MAIL_PREFIX + id + '\x01' + subject + '\x01' + body
+            try {
+                await messenger.send(to, payload, signDefault)
+                emit({ type: 'mail-sent', to, id, subject, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `mail failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'pathfinder') {
+            // Broadcast "who can hear <target>?" to the PATH address.
+            const target = String(cmd.target || '').trim().toUpperCase()
+            if (!isCallsign(target.split('-')[0])) {
+                emit({ type: 'error', error: `pathfinder: invalid target "${cmd.target}"` })
+                return
+            }
+            const qid = Math.random().toString(36).slice(2, 7)
+            emit({ type: 'pathfinder-sent', qid, target, ts: Date.now() })
+            try {
+                await messenger.send(PATH_ADDR, `${PFQ_PREFIX}${qid}\x01${target}`, signDefault)
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `pathfinder failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'relay') {
+            // Send <text> to <target> via relay station <via>.
+            const via = String(cmd.via || '').trim()
+            const target = String(cmd.target || '').trim().toUpperCase()
+            const text = String(cmd.text || '')
+            if (!via || !target || !text) {
+                emit({ type: 'error', error: 'relay: need via, target and text' }); return
+            }
+            try {
+                await messenger.send(via, `${RLY_PREFIX}${target}\x01${text}`, signDefault)
+                emit({ type: 'relay-sent', via, target, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `relay failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'mesh') {
+            // Originate a routed multi-hop message to <dest>.
+            const dest = String(cmd.dest || '').trim().toUpperCase()
+            const text = String(cmd.text || '')
+            if (!dest || !text) { emit({ type: 'error', error: 'mesh: need dest and text' }); return }
+            const id = conf.callsign + '-' + Math.random().toString(36).slice(2, 7)
+            const urgent = cmd.urgent === true
+            noteMeshId(id)   // don't re-handle our own echo
+            sendPaced(dest, buildMesh(id, MESH_MAX_HOPS, urgent ? '1' : '0', conf.callsign, dest, '', text),
+                      urgent)
+            emit({ type: 'mesh-sent', id, dest, urgent, ts: Date.now() })
+        }
+        else if (cmd.type === 'beacon') {
+            if (cmd.action === 'start') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
+                beaconBaseMin = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
+                beaconGpsTime = cmd.gpsTime === true
+                if (beaconTimer) clearTimeout(beaconTimer)
+                // With GPS: first beacon at our aligned slot. Without: listen-
+                // before-beacon warm-up (spread by callsign so joiners don't
+                // collide), then self-reschedule at the load-adaptive interval.
+                scheduleBeacon(beaconGpsTime
+                    ? beaconSlotDelayMs()
+                    : BEACON_WARMUP_MS + (beaconPhase() % BEACON_WARMUP_SPREAD))
+            } else if (cmd.action === 'stop') {
+                if (beaconTimer) { clearTimeout(beaconTimer); beaconTimer = null }
+            } else if (cmd.action === 'once') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
+                sendBeacon()
+            }
+        }
+        else {
+            emit({ type: 'error', error: `unknown command type: ${cmd.type}` })
+        }
+    })
+
+    // Stay alive until the TNC closes or we're signalled.
+    return await new Promise<number>(() => { /* never resolves */ })
+}
