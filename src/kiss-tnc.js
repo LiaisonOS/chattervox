@@ -35,7 +35,13 @@ class KISS_TNC extends EventEmitter {
 
         let socket = null
         let serial = null
-        let rx_buffer = Buffer.from([]);
+        // rx_buffer MUST persist across 'data' events: a KISS frame can arrive
+        // split across chunks (USB CDC hands up arbitrary ~64-byte boundaries).
+        // It was a plain local passed into _on_data_rx, where reassignment only
+        // updated the parameter — so every event started from empty and any
+        // split frame was lost (broke USB KISS RX; BT slipped by delivering
+        // whole frames per chunk). Make it an instance field.
+        this._rx_buffer = Buffer.from([]);
 
         // if the device is a network location
         if (device.startsWith('kiss://')) {
@@ -58,7 +64,7 @@ class KISS_TNC extends EventEmitter {
                 if (openCallback) openCallback(err)
                 this.emit('error', err)
             })
-            socket.on('data', (data) => this._on_data_rx(rx_buffer, data))
+            socket.on('data', (data) => this._on_data_rx(data))
 
             this.open = (callback) => {
                 openCallback = callback
@@ -80,7 +86,7 @@ class KISS_TNC extends EventEmitter {
             const { SerialPort } = require('serialport');
             serial = new SerialPort({ path: device, baudRate: baud_rate, autoOpen: false });
             serial.on('error', (err) => this.emit('error', err));
-            serial.on('data', (data) => this._on_data_rx(rx_buffer, data));
+            serial.on('data', (data) => this._on_data_rx(data));
             this.open = (callback) => serial.open(callback);
             this.close = (callback) => serial.close(callback);
         }
@@ -104,28 +110,40 @@ class KISS_TNC extends EventEmitter {
         }
     }
 
-    _on_data_rx(rx_buffer, data) {
-        rx_buffer = Buffer.concat([rx_buffer, data]);
+    _on_data_rx(data) {
+        // Accumulate into the persistent buffer, then scan the WHOLE buffer in
+        // one forward pass, emitting every complete frame and keeping only the
+        // trailing partial frame for the next chunk. (The old code sliced +
+        // reset offset=0 mid-loop, which — with the for-loop's offset++ — then
+        // skipped the first byte of each following frame; `consumed` avoids
+        // that, and making rx_buffer an instance field fixes split frames.)
+        const buf = Buffer.concat([this._rx_buffer, data]);
         let arr = [];
         let in_frame = false;
         let escaped = false;
-        for (let offset = 0; offset < rx_buffer.length; offset++) {
-            let byte = rx_buffer.readUInt8(offset);
+        let consumed = 0;   // bytes through the last COMPLETED frame's trailing FEND
+        for (let offset = 0; offset < buf.length; offset++) {
+            let byte = buf.readUInt8(offset);
             if (!in_frame) {
                 in_frame = (byte == defs.framing.fend);
             } else if (byte == defs.framing.fend) {
-                rx_buffer = rx_buffer.slice(offset + 1);
-                this.emit(
-                    'data', {
-                        port : ((arr[0]&(15<<4))>>4),
-                        command : (arr[0]&15),
-                        data : Buffer.from(arr.slice(1))
-                    }
-                );
+                // Trailing FEND — frame complete. Ignore empty frames (back-to-
+                // back FENDs are used as idle/keepalive delimiters).
+                if (arr.length > 0) {
+                    this.emit(
+                        'data', {
+                            port : ((arr[0]&(15<<4))>>4),
+                            command : (arr[0]&15),
+                            data : Buffer.from(arr.slice(1))
+                        }
+                    );
+                }
                 arr = [];
-                offset = 0;
-                in_frame = false;
                 escaped = false;
+                // A trailing FEND doubles as the next frame's opening FEND, so
+                // stay in_frame and keep it as the next frame's start.
+                in_frame = true;
+                consumed = offset;
             } else if (!escaped && byte == defs.framing.fesc) {
                 escaped = true;
             } else if (escaped) {
@@ -139,6 +157,8 @@ class KISS_TNC extends EventEmitter {
                 arr.push(byte);
             }
         }
+        // Keep the unconsumed tail (the partial/last-open frame) for next time.
+        this._rx_buffer = buf.slice(consumed);
     }
 
     _get_tx_buffer(command, port, data) {
