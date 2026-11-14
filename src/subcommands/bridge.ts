@@ -57,6 +57,15 @@ import * as readline from 'readline'
 //                {"type":"relayed-msg","origin","via","text","verification","ts"}
 // A station answers a PFQ only if it is the target or has heard it < 30 min.
 //
+// MESHCORE (Tier 3, Slice 1): routed multi-hop.
+//   GUI->bridge: {"type":"mesh","dest":"VE2XYZ","text":"..."}
+//   bridge->GUI: {"type":"mesh-sent","id","dest","ts"}
+//                {"type":"mesh-relayed","id","origin","dest","ts"}   (we forwarded)
+//                {"type":"mesh-msg","origin","dest","text","path","via","verification","ts"}
+// MESH frame \x01MESH\x01<id>\x01<ttl>\x01<origin>\x01<dest>\x01<path>\x01<inner>
+// is AX.25-addressed to <dest>; relays re-send (ttl--, +self to path) until it
+// reaches dest. Dedup by <id>, TTL hop limit, loop-path guard.
+//
 
 function emit(obj: any): void {
     // One compact JSON object per line. stdout to a pipe is line-safe.
@@ -144,6 +153,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const PFR_PREFIX  = '\x01PFR\x01'
     const RLY_PREFIX  = '\x01RLY\x01'
     const RMSG_PREFIX = '\x01RMSG\x01'
+
+    // Tier 3 meshcore (Slice 1): routed multi-hop with dedup + TTL.
+    //   MESH  \x01MESH\x01<id>\x01<ttl>\x01<origin>\x01<dest>\x01<path csv>\x01<inner>
+    // Addressed (AX.25) to the final <dest>; relays re-transmit it (ttl--, add
+    // self to path) until it reaches dest, which delivers. Dedup by <id>.
+    const MESH_PREFIX = '\x01MESH\x01'
+    const MESH_MAX_HOPS = 2
+    const seenMeshIds: Set<string> = new Set<string>()
+    const noteMeshId = (id: string) => {
+        seenMeshIds.add(id)
+        if (seenMeshIds.size > 1000) seenMeshIds.clear()   // crude bound (Slice 1)
+    }
+    const buildMesh = (id: string, ttl: number, origin: string, dest: string,
+                       path: string, inner: string) =>
+        MESH_PREFIX + [id, String(ttl), origin, dest, path, inner].join('\x01')
+
     const isMe = (st: { callsign: string, ssid: number }) =>
         st.callsign === conf.callsign && st.ssid === conf.ssid
 
@@ -277,6 +302,37 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             })
             return
         }
+        // Mesh frame? Deliver (if for us) or forward (if a relay). Checked for
+        // ANY frame (a relay sees frames addressed to the final dest, not it).
+        if (message.message.startsWith(MESH_PREFIX)) {
+            const p = message.message.slice(MESH_PREFIX.length).split('\x01')
+            const id = p[0] || ''
+            const ttl = parseInt(p[1] || '0', 10) || 0
+            const origin = p[2] || ''
+            const dest = p[3] || ''
+            const path = p[4] || ''
+            const inner = p.slice(5).join('\x01')
+            if (!id || seenMeshIds.has(id)) return     // dedup
+            noteMeshId(id)
+            if (dest === conf.callsign) {              // delivered to us
+                emit({
+                    type: 'mesh-msg', origin, dest, text: inner, path,
+                    via: fromStr, verification: Verification[message.verification],
+                    ts: Date.now()
+                })
+                return
+            }
+            // Forward (Slice 1: immediately; Slice 2 adds jitter + cancellation).
+            const pathList = path ? path.split(',') : []
+            if (ttl > 0 && origin !== conf.callsign && !pathList.includes(conf.callsign)) {
+                const newPath = (path ? path + ',' : '') + conf.callsign
+                messenger.send(dest, buildMesh(id, ttl - 1, origin, dest, newPath, inner),
+                               signDefault).catch(() => {})
+                emit({ type: 'mesh-relayed', id, origin, dest, ts: Date.now() })
+            }
+            return
+        }
+
         const { channel, kind } = classify(message.to, fromStr)
         // Show DMs to us, and rooms we've joined. Drop rooms we're not in.
         if (kind !== 'dm' && !joined.has(channel)) return
@@ -394,6 +450,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             } catch (err) {
                 emit({ type: 'error',
                        error: `relay failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'mesh') {
+            // Originate a routed multi-hop message to <dest>.
+            const dest = String(cmd.dest || '').trim().toUpperCase()
+            const text = String(cmd.text || '')
+            if (!dest || !text) { emit({ type: 'error', error: 'mesh: need dest and text' }); return }
+            const id = conf.callsign + '-' + Math.random().toString(36).slice(2, 7)
+            noteMeshId(id)   // don't re-handle our own echo
+            try {
+                await messenger.send(dest, buildMesh(id, MESH_MAX_HOPS, conf.callsign, dest, '', text),
+                                     signDefault)
+                emit({ type: 'mesh-sent', id, dest, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `mesh failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
             }
         }
         else if (cmd.type === 'beacon') {
