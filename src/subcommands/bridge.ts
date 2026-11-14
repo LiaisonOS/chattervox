@@ -27,12 +27,20 @@ import * as readline from 'readline'
 //   {"type":"rx","from":"VA2XYZ-1","to":"CQ","channel":"CQ","kind":"room",
 //                "message":"hi","verification":"Valid","ts":...}
 //   {"type":"tx","to":"CQ","channel":"CQ","kind":"room","message":"hello","ts":...}
+//   {"type":"beacon","from":"VA2GWM","text":"QRV Montreal","verification":"Valid","ts":...}
+//   {"type":"beacon-sent","text":"QRV","ts":...}         // our own beacon went out
 //   {"type":"error","error":"..."}
 //
 // GUI -> Bridge (stdin):
 //   {"type":"tx","to":"CQ","text":"hello","sign":true}   // to/sign optional
 //   {"type":"join","room":"EMCOMM"}
 //   {"type":"leave","room":"EMCOMM"}
+//   {"type":"beacon","action":"start","intervalMin":15,"text":"QRV Montreal"}
+//   {"type":"beacon","action":"stop"}
+//   {"type":"beacon","action":"once","text":"QRV"}       // send one beacon now
+//
+// Beacons broadcast to the AX.25 address "BEACON"; the bridge always listens
+// for it and emits a `beacon` event (never a chat message) for the roster.
 //
 
 function emit(obj: any): void {
@@ -43,6 +51,7 @@ function emit(obj: any): void {
 export async function main(args: any, conf: Config, ks: Keystore): Promise<number> {
 
     const messenger = new Messenger(conf, ks)
+
     // Sign by default ONLY when config.signingKey actually matches a keypair in
     // the keystore for the CURRENT callsign. After a station rename the old key
     // won't match — degrade to unsigned instead of crashing, and warn the GUI.
@@ -63,6 +72,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     // validated against the AX.25 callsign rule (1-6 alphanumeric chars).
     const joined: Set<string> = new Set<string>(['CQ'])
     const roomList = (): string[] => Array.from(joined)
+
+    // Presence beacons. Beacons are broadcast to the dedicated AX.25 address
+    // "BEACON"; we always listen for them (regardless of joined rooms) and feed
+    // them to the GUI's Stations-on-Air roster instead of a chat tab.
+    const BEACON_ADDR = 'BEACON'
+    let beaconTimer: ReturnType<typeof setInterval> | null = null
+    let beaconText = 'QRV'
+    const sendBeacon = async () => {
+        try {
+            await messenger.send(BEACON_ADDR, beaconText || 'QRV', signDefault)
+            emit({ type: 'beacon-sent', text: beaconText || 'QRV', ts: Date.now() })
+        } catch (err) {
+            emit({ type: 'error',
+                   error: `beacon failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+        }
+    }
 
     // Classify an incoming/outgoing station pair into a channel + kind.
     //  - addressed to us  -> DM, channel = the other station
@@ -86,6 +111,17 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
 
     messenger.on('message', (message: MessageEvent) => {
         const fromStr = stationToCallsignSSID(message.from)
+        // Presence beacon? Feed the roster, never a chat tab. Always surfaced.
+        if (message.to.callsign === BEACON_ADDR) {
+            emit({
+                type: 'beacon',
+                from: fromStr,
+                text: message.message,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
         const { channel, kind } = classify(message.to, fromStr)
         // Show DMs to us, and rooms we've joined. Drop rooms we're not in.
         if (kind !== 'dm' && !joined.has(channel)) return
@@ -134,9 +170,6 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             if (text === '') return
             try {
                 await messenger.send(to, text, sign)
-                // Tag the echo with the channel so the GUI renders it in the
-                // right tab. CQ or a joined room name => room; anything else
-                // (a specific callsign we're messaging) => DM.
                 const kind = (to === 'CQ' || joined.has(to.toUpperCase())) ? 'room' : 'dm'
                 emit({ type: 'tx', to, channel: to, kind, message: text, ts: Date.now() })
             } catch (err) {
@@ -158,6 +191,20 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const room = String(cmd.room || '').toUpperCase()
             if (room !== 'CQ') joined.delete(room)   // CQ can't be left
             emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'beacon') {
+            if (cmd.action === 'start') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                const mins = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
+                if (beaconTimer) clearInterval(beaconTimer)
+                sendBeacon()                                   // beacon once now
+                beaconTimer = setInterval(sendBeacon, mins * 60 * 1000)
+            } else if (cmd.action === 'stop') {
+                if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null }
+            } else if (cmd.action === 'once') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                sendBeacon()
+            }
         }
         else {
             emit({ type: 'error', error: `unknown command type: ${cmd.type}` })
