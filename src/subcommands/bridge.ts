@@ -38,9 +38,12 @@ import * as readline from 'readline'
 //   {"type":"beacon","action":"start","intervalMin":15,"text":"QRV Montreal"}
 //   {"type":"beacon","action":"stop"}
 //   {"type":"beacon","action":"once","text":"QRV"}       // send one beacon now
+//   {"type":"mail","to":"VA2GWM","subject":"Sked","body":"meet 1900Z 40m"}
 //
 // Beacons broadcast to the AX.25 address "BEACON"; the bridge always listens
 // for it and emits a `beacon` event (never a chat message) for the roster.
+// Mail carries a \x01MAIL\x01 sentinel; the bridge emits it as a `mail` event
+// ({from,to,subject,body,verification,ts}) + a `mail-sent` echo on send.
 //
 
 function emit(obj: any): void {
@@ -89,6 +92,14 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         }
     }
 
+    // Mail: a store-and-forward message (subject + body) to one callsign. It
+    // rides the same transport as chat but carries a control-char sentinel the
+    // chat UI can never produce, so the receiver files it into the Inbox rather
+    // than a chat tab. Format: \x01MAIL\x01<subject>\x01<body>
+    const MAIL_PREFIX = '\x01MAIL\x01'
+    const MAIL_SUBJ_MAX = 60
+    const MAIL_BODY_MAX = 500
+
     // Classify an incoming/outgoing station pair into a channel + kind.
     //  - addressed to us  -> DM, channel = the other station
     //  - otherwise        -> room, channel = the destination name
@@ -111,6 +122,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
 
     messenger.on('message', (message: MessageEvent) => {
         const fromStr = stationToCallsignSSID(message.from)
+        // Mail? Structured subject+body — file into the Inbox, never a chat tab.
+        if (message.message.startsWith(MAIL_PREFIX)) {
+            const rest = message.message.slice(MAIL_PREFIX.length)
+            const idx = rest.indexOf('\x01')
+            const subject = idx >= 0 ? rest.slice(0, idx) : ''
+            const body = idx >= 0 ? rest.slice(idx + 1) : rest
+            emit({
+                type: 'mail',
+                from: fromStr,
+                to: stationToCallsignSSID(message.to),
+                subject, body,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
         // Presence beacon? Feed the roster, never a chat tab. Always surfaced.
         if (message.to.callsign === BEACON_ADDR) {
             emit({
@@ -191,6 +218,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const room = String(cmd.room || '').toUpperCase()
             if (room !== 'CQ') joined.delete(room)   // CQ can't be left
             emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'mail') {
+            const to = String(cmd.to || '').trim()
+            // Subject must not contain the \x01 delimiter; clamp both fields.
+            const subject = String(cmd.subject || '')
+                .replace(/[\x00-\x08\x0e-\x1f]/g, ' ').slice(0, MAIL_SUBJ_MAX)
+            const body = String(cmd.body || '').slice(0, MAIL_BODY_MAX)
+            if (!to) { emit({ type: 'error', error: 'mail: missing recipient' }); return }
+            const payload = MAIL_PREFIX + subject + '\x01' + body
+            try {
+                await messenger.send(to, payload, signDefault)
+                emit({ type: 'mail-sent', to, subject, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `mail failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
         }
         else if (cmd.type === 'beacon') {
             if (cmd.action === 'start') {
