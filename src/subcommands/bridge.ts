@@ -108,6 +108,33 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const heard: Map<string, number> = new Map<string, number>()
     const HEARD_WINDOW_S = 30 * 60   // "reachable" if heard within this window
 
+    // Slice 4: TX pacing — channel courtesy + our own airtime budget. Applies to
+    // AUTOMATED traffic (beacons, mesh relays/acks, mesh originations), NOT to
+    // the operator's own chat/DM/mail (those go promptly; the TNC's carrier
+    // sense handles them). Emergency (urgent) bypasses both gates.
+    let lastHeardTs = 0                       // when we last decoded any frame
+    const QUIET_GAP_MS = 2000                 // wait for this much silence first
+    const MAX_DEFER_MS = 8000                 // …but never starve a frame past this
+    let txTokens = 6                          // token bucket (burst)
+    const TX_CAPACITY = 6
+    const TX_REFILL_MS = 10000                // +1 token / 10 s → ~6/min sustained
+    setInterval(() => { if (txTokens < TX_CAPACITY) txTokens++ }, TX_REFILL_MS)
+    const sendPaced = (dest: string, payload: string, urgent = false): void => {
+        const deadline = Date.now() + MAX_DEFER_MS
+        const attempt = () => {
+            const now = Date.now()
+            const forced = now >= deadline
+            const quiet = (now - lastHeardTs) >= QUIET_GAP_MS
+            if (urgent || forced || (quiet && txTokens > 0)) {
+                if (!urgent && txTokens > 0) txTokens--
+                messenger.send(dest, payload, signDefault).catch(() => {})
+                return
+            }
+            setTimeout(attempt, 300)          // channel busy or out of budget → wait
+        }
+        attempt()
+    }
+
     // Presence beacons (Tier 2: structured). Broadcast to the "BEACON" address:
     //   \x01B1\x01<grid>\x01<comment>\x01<neighbor1,neighbor2,...>
     // We always listen for them and feed the Stations-on-Air roster + the
@@ -130,7 +157,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const comment = (beaconText || 'QRV').replace(/[\x00-\x08\x0e-\x1f]/g, ' ')
             const grid = beaconGrid.replace(/[\x00-\x1f,]/g, '')
             const payload = `${BCN_PREFIX}${grid}\x01${comment}\x01${neigh.join(',')}`
-            await messenger.send(BEACON_ADDR, payload, signDefault)
+            sendPaced(BEACON_ADDR, payload, false)   // paced: beacons defer to live traffic
             emit({ type: 'beacon-sent', text: comment, grid, neighbors: neigh, ts: now })
         } catch (err) {
             emit({ type: 'error',
@@ -160,9 +187,10 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     const RMSG_PREFIX = '\x01RMSG\x01'
 
     // Tier 3 meshcore (Slice 1): routed multi-hop with dedup + TTL.
-    //   MESH  \x01MESH\x01<id>\x01<ttl>\x01<origin>\x01<dest>\x01<path csv>\x01<inner>
+    //   MESH  \x01MESH\x01<id>\x01<ttl>\x01<prio>\x01<origin>\x01<dest>\x01<path>\x01<inner>
     // Addressed (AX.25) to the final <dest>; relays re-transmit it (ttl--, add
     // self to path) until it reaches dest, which delivers. Dedup by <id>.
+    // <prio> "1" = urgent (Emergency): bypasses TX pacing end-to-end.
     const MESH_PREFIX = '\x01MESH\x01'
     // Slice 3: a delivery ack is just a MESH message back to the origin whose
     // inner payload is this marker + the original mesh-id — so it reuses all the
@@ -179,9 +207,9 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         seenMeshIds.add(id)
         if (seenMeshIds.size > 1000) seenMeshIds.clear()   // crude bound
     }
-    const buildMesh = (id: string, ttl: number, origin: string, dest: string,
-                       path: string, inner: string) =>
-        MESH_PREFIX + [id, String(ttl), origin, dest, path, inner].join('\x01')
+    const buildMesh = (id: string, ttl: number, prio: string, origin: string,
+                       dest: string, path: string, inner: string) =>
+        MESH_PREFIX + [id, String(ttl), prio, origin, dest, path, inner].join('\x01')
 
     const isMe = (st: { callsign: string, ssid: number }) =>
         st.callsign === conf.callsign && st.ssid === conf.ssid
@@ -210,6 +238,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
         const fromStr = stationToCallsignSSID(message.from)
         // Every received frame proves we can hear `from` right now.
         heard.set(message.from.callsign, Date.now())
+        lastHeardTs = Date.now()              // channel activity, for TX pacing
 
         // Pathfinder query: "who can hear <target>?" (broadcast to PATH).
         if (message.to.callsign === PATH_ADDR && message.message.startsWith(PFQ_PREFIX)) {
@@ -322,10 +351,12 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const p = message.message.slice(MESH_PREFIX.length).split('\x01')
             const id = p[0] || ''
             const ttl = parseInt(p[1] || '0', 10) || 0
-            const origin = p[2] || ''
-            const dest = p[3] || ''
-            const path = p[4] || ''
-            const inner = p.slice(5).join('\x01')
+            const prio = p[2] || '0'
+            const origin = p[3] || ''
+            const dest = p[4] || ''
+            const path = p[5] || ''
+            const inner = p.slice(6).join('\x01')
+            const urgent = prio === '1'
             if (!id) return
             const relayedCopy = (fromStr !== origin)   // a relay (not the origin) transmitted it
 
@@ -354,11 +385,12 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
                     via: fromStr, verification: Verification[message.verification],
                     ts: Date.now()
                 })
-                // Auto-ack on receipt: route a tiny ack back to the origin.
+                // Auto-ack on receipt: route a tiny ack back to the origin
+                // (same priority as the message it confirms).
                 const ackId = conf.callsign + '-a' + Math.random().toString(36).slice(2, 6)
                 noteMeshId(ackId)
-                messenger.send(origin, buildMesh(ackId, MESH_MAX_HOPS, conf.callsign, origin,
-                                                 '', MESH_ACK_PREFIX + id), signDefault).catch(() => {})
+                sendPaced(origin, buildMesh(ackId, MESH_MAX_HOPS, prio, conf.callsign, origin,
+                                            '', MESH_ACK_PREFIX + id), urgent)
                 return
             }
             // Schedule a forward with random jitter; if another relay beats us to
@@ -369,8 +401,7 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
                 const timer = setTimeout(() => {
                     pendingForwards.delete(id)
                     const newPath = (path ? path + ',' : '') + conf.callsign
-                    messenger.send(dest, buildMesh(id, ttl - 1, origin, dest, newPath, inner),
-                                   signDefault).catch(() => {})
+                    sendPaced(dest, buildMesh(id, ttl - 1, prio, origin, dest, newPath, inner), urgent)
                     emit({ type: 'mesh-relayed', id, origin, dest, ts: Date.now() })
                 }, jitter)
                 pendingForwards.set(id, timer)
@@ -503,15 +534,11 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             const text = String(cmd.text || '')
             if (!dest || !text) { emit({ type: 'error', error: 'mesh: need dest and text' }); return }
             const id = conf.callsign + '-' + Math.random().toString(36).slice(2, 7)
+            const urgent = cmd.urgent === true
             noteMeshId(id)   // don't re-handle our own echo
-            try {
-                await messenger.send(dest, buildMesh(id, MESH_MAX_HOPS, conf.callsign, dest, '', text),
-                                     signDefault)
-                emit({ type: 'mesh-sent', id, dest, ts: Date.now() })
-            } catch (err) {
-                emit({ type: 'error',
-                       error: `mesh failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
-            }
+            sendPaced(dest, buildMesh(id, MESH_MAX_HOPS, urgent ? '1' : '0', conf.callsign, dest, '', text),
+                      urgent)
+            emit({ type: 'mesh-sent', id, dest, urgent, ts: Date.now() })
         }
         else if (cmd.type === 'beacon') {
             if (cmd.action === 'start') {
