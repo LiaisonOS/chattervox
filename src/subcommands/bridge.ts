@@ -1,0 +1,422 @@
+import { Config } from '../config'
+import { Keystore } from '../Keystore'
+import { Messenger, MessageEvent, Verification } from '../Messenger'
+import { stationToCallsignSSID, isCallsign } from '../utils'
+import * as readline from 'readline'
+
+//
+// bridge — a headless JSON-lines adapter around Messenger so a GUI front-end
+// (QtChattervox) can drive chattervox over stdin/stdout. It reuses the exact
+// same engine as `chat` (KISS, AX.25, deflate, signing/verification), so a
+// GUI built on it interoperates with every other chattervox station on air.
+//
+// Protocol: one JSON object per line, UTF-8, '\n'-terminated.
+//
+// CHANNELS: chattervox addresses by a 1-6 char alphanumeric name in the AX.25
+// destination field. "CQ" is the default room; any other name (EMCOMM, EOC,
+// NET1 …) is a chat room. A message addressed directly to our callsign is a
+// DM. Every rx/tx carries a `channel` tag so the GUI can route it to a pane:
+//   - room message  -> channel = the room name ("CQ", "EMCOMM", …)
+//   - direct to us   -> channel = the OTHER station's callsign-ssid (a DM)
+// We only surface rooms the GUI has joined (CQ is always joined), plus DMs.
+//
+// Bridge -> GUI (stdout):
+//   {"type":"ready","callsign":"VA2OPS","ssid":0,"signing":true,"rooms":["CQ"]}
+//   {"type":"status","state":"open"|"close"|"tnc-error","error"?:"..."}
+//   {"type":"rooms","rooms":["CQ","EMCOMM"]}              // after join/leave
+//   {"type":"rx","from":"VA2XYZ-1","to":"CQ","channel":"CQ","kind":"room",
+//                "message":"hi","verification":"Valid","ts":...}
+//   {"type":"tx","to":"CQ","channel":"CQ","kind":"room","message":"hello","ts":...}
+//   {"type":"beacon","from":"VA2GWM","text":"QRV Montreal","verification":"Valid","ts":...}
+//   {"type":"beacon-sent","text":"QRV","ts":...}         // our own beacon went out
+//   {"type":"error","error":"..."}
+//
+// GUI -> Bridge (stdin):
+//   {"type":"tx","to":"CQ","text":"hello","sign":true}   // to/sign optional
+//   {"type":"join","room":"EMCOMM"}
+//   {"type":"leave","room":"EMCOMM"}
+//   {"type":"beacon","action":"start","intervalMin":15,"text":"QRV Montreal"}
+//   {"type":"beacon","action":"stop"}
+//   {"type":"beacon","action":"once","text":"QRV"}       // send one beacon now
+//   {"type":"mail","to":"VA2GWM","id":"k3f9a","subject":"Sked","body":"meet 1900Z 40m"}
+//
+// Beacons broadcast to the AX.25 address "BEACON"; the bridge always listens
+// for it and emits a `beacon` event (never a chat message) for the roster.
+// Mail carries a \x01MAIL\x01<id>\x01<subj>\x01<body> sentinel; the bridge files
+// it (addressed-to-us only), emits a `mail` event + a `mail-sent` echo on send,
+// and AUTO-ACKs on receipt with \x01MACK\x01<id> -> sender gets a `mail-ack`
+// event ({from,id,ts}). Duplicate ids are de-duped (filed once) but re-acked.
+//
+// PATHFINDER (Tier 1): relay discovery + app-level relay.
+//   GUI->bridge: {"type":"pathfinder","target":"VE2XYZ"}            (broadcast PFQ)
+//                {"type":"relay","via":"VA2GWM","target":"VE2XYZ","text":"..."}
+//   bridge->GUI: {"type":"pathfinder-sent","qid","target","ts"}
+//                {"type":"pathfinder-reply","from","qid","target","ageSec","ts"}
+//                {"type":"relay-sent","via","target","ts"}          (we asked a relay)
+//                {"type":"relayed-out","origin","target","ts"}      (we relayed for someone)
+//                {"type":"relayed-msg","origin","via","text","verification","ts"}
+// A station answers a PFQ only if it is the target or has heard it < 30 min.
+//
+
+function emit(obj: any): void {
+    // One compact JSON object per line. stdout to a pipe is line-safe.
+    process.stdout.write(JSON.stringify(obj) + '\n')
+}
+
+export async function main(args: any, conf: Config, ks: Keystore): Promise<number> {
+
+    const messenger = new Messenger(conf, ks)
+
+    // Sign by default ONLY when config.signingKey actually matches a keypair in
+    // the keystore for the CURRENT callsign. After a station rename the old key
+    // won't match — degrade to unsigned instead of crashing, and warn the GUI.
+    let signDefault = false
+    let signingWarning = ''
+    if (typeof conf.signingKey === 'string' && conf.signingKey.length > 0) {
+        let hasKey = false
+        try {
+            hasKey = ks.getKeyPairs(conf.callsign)
+                       .some((k: any) => k.public === conf.signingKey)
+        } catch (e) { hasKey = false }
+        if (hasKey) signDefault = true
+        else signingWarning = `No signing key for ${conf.callsign} in the keystore — sending UNSIGNED. ` +
+                              `Run "chattervox genkey" (or restart the Chattervox mode) to create one.`
+    }
+
+    // Rooms we're listening to. CQ is always joined. Names are upper-cased and
+    // validated against the AX.25 callsign rule (1-6 alphanumeric chars).
+    const joined: Set<string> = new Set<string>(['CQ'])
+    const roomList = (): string[] => Array.from(joined)
+
+    // Who we can hear right now (direct neighbors), from every received frame.
+    // Declared here because beacons advertise it (Tier 2 topology) and
+    // Pathfinder answers from it (Tier 1). callsign -> last-heard ms.
+    const heard: Map<string, number> = new Map<string, number>()
+    const HEARD_WINDOW_S = 30 * 60   // "reachable" if heard within this window
+
+    // Presence beacons (Tier 2: structured). Broadcast to the "BEACON" address:
+    //   \x01B1\x01<grid>\x01<comment>\x01<neighbor1,neighbor2,...>
+    // We always listen for them and feed the Stations-on-Air roster + the
+    // who-hears-whom topology map. Legacy plain-text beacons still parse (as a
+    // comment with no grid/neighbors).
+    const BEACON_ADDR = 'BEACON'
+    const BCN_PREFIX  = '\x01B1\x01'
+    let beaconTimer: ReturnType<typeof setInterval> | null = null
+    let beaconText = 'QRV'
+    let beaconGrid = ''
+    const sendBeacon = async () => {
+        try {
+            const now = Date.now()
+            // Advertise up to 8 most-recently-heard neighbors (airtime budget).
+            const neigh = Array.from(heard.entries())
+                .filter(([c, t]) => c !== conf.callsign && (now - t) <= HEARD_WINDOW_S * 1000)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 8)
+                .map(([c]) => c)
+            const comment = (beaconText || 'QRV').replace(/[\x00-\x08\x0e-\x1f]/g, ' ')
+            const grid = beaconGrid.replace(/[\x00-\x1f,]/g, '')
+            const payload = `${BCN_PREFIX}${grid}\x01${comment}\x01${neigh.join(',')}`
+            await messenger.send(BEACON_ADDR, payload, signDefault)
+            emit({ type: 'beacon-sent', text: comment, grid, neighbors: neigh, ts: now })
+        } catch (err) {
+            emit({ type: 'error',
+                   error: `beacon failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+        }
+    }
+
+    // Mail: a store-and-forward message (subject + body) to one callsign. It
+    // rides the same transport as chat but carries a control-char sentinel the
+    // chat UI can never produce, so the receiver files it into the Inbox rather
+    // than a chat tab. Format: \x01MAIL\x01<subject>\x01<body>
+    const MAIL_PREFIX = '\x01MAIL\x01'   // \x01MAIL\x01<id>\x01<subject>\x01<body>
+    const MACK_PREFIX = '\x01MACK\x01'   // \x01MACK\x01<id>  (ack on receipt)
+    const MAIL_SUBJ_MAX = 60
+    const MAIL_BODY_MAX = 500
+    const seenMailIds: Set<string> = new Set<string>()   // de-dup filed mail
+
+    // Pathfinder (Tier 1): reactive relay discovery + app-level relay.
+    //   PFQ  \x01PFQ\x01<qid>\x01<target>           broadcast to "PATH"
+    //   PFR  \x01PFR\x01<qid>\x01<target>\x01<ageS> reply to the querier
+    //   RLY  \x01RLY\x01<target>\x01<text>          A -> chosen relay R
+    //   RMSG \x01RMSG\x01<origin>\x01<text>          R -> target Z (origin preserved)
+    const PATH_ADDR   = 'PATH'
+    const PFQ_PREFIX  = '\x01PFQ\x01'
+    const PFR_PREFIX  = '\x01PFR\x01'
+    const RLY_PREFIX  = '\x01RLY\x01'
+    const RMSG_PREFIX = '\x01RMSG\x01'
+    const isMe = (st: { callsign: string, ssid: number }) =>
+        st.callsign === conf.callsign && st.ssid === conf.ssid
+
+    // Classify an incoming/outgoing station pair into a channel + kind.
+    //  - addressed to us  -> DM, channel = the other station
+    //  - otherwise        -> room, channel = the destination name
+    const classify = (to: { callsign: string, ssid: number },
+                      other: string): { channel: string, kind: string } => {
+        if (to.callsign === conf.callsign && to.ssid === conf.ssid)
+            return { channel: other, kind: 'dm' }
+        return { channel: to.callsign, kind: 'room' }
+    }
+
+    messenger.on('close', () => {
+        emit({ type: 'status', state: 'close' })
+        process.exit(1)
+    })
+
+    messenger.on('tnc-error', (err: any) => {
+        emit({ type: 'status', state: 'tnc-error',
+               error: String(err && err.message ? err.message : err) })
+    })
+
+    messenger.on('message', (message: MessageEvent) => {
+        const fromStr = stationToCallsignSSID(message.from)
+        // Every received frame proves we can hear `from` right now.
+        heard.set(message.from.callsign, Date.now())
+
+        // Pathfinder query: "who can hear <target>?" (broadcast to PATH).
+        if (message.to.callsign === PATH_ADDR && message.message.startsWith(PFQ_PREFIX)) {
+            const rest = message.message.slice(PFQ_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const qid = i1 >= 0 ? rest.slice(0, i1) : ''
+            const target = (i1 >= 0 ? rest.slice(i1 + 1) : '').toUpperCase()
+            // Answer if WE are the target (reachable directly) or we've heard it.
+            let ageS = -1
+            if (target === conf.callsign) ageS = 0
+            else if (heard.has(target)) {
+                const a = Math.round((Date.now() - (heard.get(target) as number)) / 1000)
+                if (a <= HEARD_WINDOW_S) ageS = a
+            }
+            if (ageS >= 0 && qid) {
+                messenger.send(fromStr, `${PFR_PREFIX}${qid}\x01${target}\x01${ageS}`, signDefault)
+                         .catch(() => {})
+            }
+            return
+        }
+        // Pathfinder reply addressed to us.
+        if (message.message.startsWith(PFR_PREFIX) && isMe(message.to)) {
+            const p = message.message.slice(PFR_PREFIX.length).split('\x01')
+            emit({ type: 'pathfinder-reply', from: fromStr,
+                   qid: p[0] || '', target: (p[1] || ''),
+                   ageSec: parseInt(p[2] || '0', 10) || 0, ts: Date.now() })
+            return
+        }
+        // Relay request addressed to us: forward the text to <target>, keeping
+        // the original sender's identity (origin = whoever sent us the RLY).
+        if (message.message.startsWith(RLY_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RLY_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const target = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : ''
+            if (target && text) {
+                messenger.send(target, `${RMSG_PREFIX}${fromStr}\x01${text}`, signDefault)
+                         .catch(() => {})
+                emit({ type: 'relayed-out', origin: fromStr, target, ts: Date.now() })
+            }
+            return
+        }
+        // A relayed message delivered to us (via some relay station).
+        if (message.message.startsWith(RMSG_PREFIX) && isMe(message.to)) {
+            const rest = message.message.slice(RMSG_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const origin = i1 >= 0 ? rest.slice(0, i1) : ''
+            const text = i1 >= 0 ? rest.slice(i1 + 1) : rest
+            emit({ type: 'relayed-msg', origin, via: fromStr, text,
+                   verification: Verification[message.verification], ts: Date.now() })
+            return
+        }
+
+        // Mail? Structured id+subject+body — file into the Inbox, never a chat
+        // tab. Only mail addressed to US (not overheard mail for others).
+        if (message.message.startsWith(MAIL_PREFIX)) {
+            if (!(message.to.callsign === conf.callsign && message.to.ssid === conf.ssid))
+                return
+            const rest = message.message.slice(MAIL_PREFIX.length)
+            const i1 = rest.indexOf('\x01')
+            const i2 = i1 >= 0 ? rest.indexOf('\x01', i1 + 1) : -1
+            const id = i1 >= 0 ? rest.slice(0, i1) : ''
+            const subject = (i1 >= 0 && i2 >= 0) ? rest.slice(i1 + 1, i2) : ''
+            const body = i2 >= 0 ? rest.slice(i2 + 1)
+                        : (i1 >= 0 ? rest.slice(i1 + 1) : rest)
+            // Auto-ack on receipt — ALWAYS (even a duplicate: the sender retried
+            // because our earlier ack was lost). Fire-and-forget.
+            if (id)
+                messenger.send(fromStr, MACK_PREFIX + id, signDefault).catch(() => {})
+            // De-dup filing: don't file the same mail twice.
+            if (id && seenMailIds.has(id)) return
+            if (id) seenMailIds.add(id)
+            emit({
+                type: 'mail',
+                from: fromStr,
+                to: stationToCallsignSSID(message.to),
+                id, subject, body,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
+        // Mail acknowledgement from a station we sent mail to.
+        if (message.message.startsWith(MACK_PREFIX)) {
+            const id = message.message.slice(MACK_PREFIX.length)
+            emit({ type: 'mail-ack', from: fromStr, id, ts: Date.now() })
+            return
+        }
+        // Presence beacon? Feed the roster + topology, never a chat tab.
+        if (message.to.callsign === BEACON_ADDR) {
+            let grid = '', text = message.message, neighbors: string[] = []
+            if (message.message.startsWith(BCN_PREFIX)) {
+                const p = message.message.slice(BCN_PREFIX.length).split('\x01')
+                grid = p[0] || ''
+                text = p[1] || ''
+                neighbors = (p[2] || '').split(',').map(s => s.trim()).filter(s => s.length > 0)
+            }
+            emit({
+                type: 'beacon',
+                from: fromStr,
+                grid, text, neighbors,
+                verification: Verification[message.verification],
+                ts: Date.now()
+            })
+            return
+        }
+        const { channel, kind } = classify(message.to, fromStr)
+        // Show DMs to us, and rooms we've joined. Drop rooms we're not in.
+        if (kind !== 'dm' && !joined.has(channel)) return
+        emit({
+            type: 'rx',
+            from: fromStr,
+            to: stationToCallsignSSID(message.to),
+            channel,
+            kind,
+            message: message.message,
+            verification: Verification[message.verification], // enum -> name
+            ts: Date.now()
+        })
+    })
+
+    try {
+        await messenger.openTNC()
+    } catch (err) {
+        emit({ type: 'status', state: 'tnc-error',
+               error: `Could not open the KISS TNC at ${conf.kissPort}. Is the TNC running?` })
+        return 1
+    }
+
+    emit({ type: 'status', state: 'open' })
+    emit({ type: 'ready', callsign: conf.callsign, ssid: conf.ssid,
+           signing: signDefault, rooms: roomList() })
+    if (signingWarning) emit({ type: 'error', error: signingWarning })
+
+    // Read newline-delimited JSON commands from the GUI.
+    const rl = readline.createInterface({ input: process.stdin })
+    rl.on('line', async (line: string) => {
+        line = line.trim()
+        if (line === '') return
+        let cmd: any
+        try {
+            cmd = JSON.parse(line)
+        } catch (err) {
+            emit({ type: 'error', error: `bad JSON command: ${line}` })
+            return
+        }
+
+        if (cmd.type === 'tx') {
+            const to: string = (typeof cmd.to === 'string' && cmd.to.length > 0) ? cmd.to : 'CQ'
+            const text: string = typeof cmd.text === 'string' ? cmd.text : ''
+            const sign: boolean = typeof cmd.sign === 'boolean' ? cmd.sign : signDefault
+            if (text === '') return
+            try {
+                await messenger.send(to, text, sign)
+                const kind = (to === 'CQ' || joined.has(to.toUpperCase())) ? 'room' : 'dm'
+                emit({ type: 'tx', to, channel: to, kind, message: text, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `send failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'join') {
+            const room = String(cmd.room || '').toUpperCase()
+            if (!isCallsign(room)) {
+                emit({ type: 'error',
+                       error: `invalid room "${cmd.room}" — 1-6 letters/digits (AX.25 limit)` })
+                return
+            }
+            joined.add(room)
+            emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'leave') {
+            const room = String(cmd.room || '').toUpperCase()
+            if (room !== 'CQ') joined.delete(room)   // CQ can't be left
+            emit({ type: 'rooms', rooms: roomList() })
+        }
+        else if (cmd.type === 'mail') {
+            const to = String(cmd.to || '').trim()
+            // id + subject must not contain the \x01 delimiter; clamp fields.
+            const id = String(cmd.id || '').replace(/[\x00-\x1f]/g, '').slice(0, 12)
+            const subject = String(cmd.subject || '')
+                .replace(/[\x00-\x08\x0e-\x1f]/g, ' ').slice(0, MAIL_SUBJ_MAX)
+            const body = String(cmd.body || '').slice(0, MAIL_BODY_MAX)
+            if (!to) { emit({ type: 'error', error: 'mail: missing recipient' }); return }
+            const payload = MAIL_PREFIX + id + '\x01' + subject + '\x01' + body
+            try {
+                await messenger.send(to, payload, signDefault)
+                emit({ type: 'mail-sent', to, id, subject, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `mail failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'pathfinder') {
+            // Broadcast "who can hear <target>?" to the PATH address.
+            const target = String(cmd.target || '').trim().toUpperCase()
+            if (!isCallsign(target.split('-')[0])) {
+                emit({ type: 'error', error: `pathfinder: invalid target "${cmd.target}"` })
+                return
+            }
+            const qid = Math.random().toString(36).slice(2, 7)
+            emit({ type: 'pathfinder-sent', qid, target, ts: Date.now() })
+            try {
+                await messenger.send(PATH_ADDR, `${PFQ_PREFIX}${qid}\x01${target}`, signDefault)
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `pathfinder failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'relay') {
+            // Send <text> to <target> via relay station <via>.
+            const via = String(cmd.via || '').trim()
+            const target = String(cmd.target || '').trim().toUpperCase()
+            const text = String(cmd.text || '')
+            if (!via || !target || !text) {
+                emit({ type: 'error', error: 'relay: need via, target and text' }); return
+            }
+            try {
+                await messenger.send(via, `${RLY_PREFIX}${target}\x01${text}`, signDefault)
+                emit({ type: 'relay-sent', via, target, ts: Date.now() })
+            } catch (err) {
+                emit({ type: 'error',
+                       error: `relay failed: ${String(err && (err as any).message ? (err as any).message : err)}` })
+            }
+        }
+        else if (cmd.type === 'beacon') {
+            if (cmd.action === 'start') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
+                const mins = Number(cmd.intervalMin) > 0 ? Number(cmd.intervalMin) : 15
+                if (beaconTimer) clearInterval(beaconTimer)
+                sendBeacon()                                   // beacon once now
+                beaconTimer = setInterval(sendBeacon, mins * 60 * 1000)
+            } else if (cmd.action === 'stop') {
+                if (beaconTimer) { clearInterval(beaconTimer); beaconTimer = null }
+            } else if (cmd.action === 'once') {
+                if (typeof cmd.text === 'string') beaconText = cmd.text
+                if (typeof cmd.grid === 'string') beaconGrid = cmd.grid
+                sendBeacon()
+            }
+        }
+        else {
+            emit({ type: 'error', error: `unknown command type: ${cmd.type}` })
+        }
+    })
+
+    // Stay alive until the TNC closes or we're signalled.
+    return await new Promise<number>(() => { /* never resolves */ })
+}
