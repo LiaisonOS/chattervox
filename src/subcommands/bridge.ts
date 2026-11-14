@@ -61,7 +61,12 @@ import * as readline from 'readline'
 //   GUI->bridge: {"type":"mesh","dest":"VE2XYZ","text":"..."}
 //   bridge->GUI: {"type":"mesh-sent","id","dest","ts"}
 //                {"type":"mesh-relayed","id","origin","dest","ts"}   (we forwarded)
+//                {"type":"mesh-relay-cancelled","id","by","ts"}      (someone beat us to it)
 //                {"type":"mesh-msg","origin","dest","text","path","via","verification","ts"}
+//                {"type":"mesh-ack","id","from","ts"}                (our send was delivered)
+// Delivery is auto-acked: the dest routes a MESH back to the origin whose inner
+// is MESH_ACK_PREFIX+<original id> → origin gets mesh-ack. Relays jitter + cancel
+// on overhear so only one forwards each frame (and each ack).
 // MESH frame \x01MESH\x01<id>\x01<ttl>\x01<origin>\x01<dest>\x01<path>\x01<inner>
 // is AX.25-addressed to <dest>; relays re-send (ttl--, +self to path) until it
 // reaches dest. Dedup by <id>, TTL hop limit, loop-path guard.
@@ -159,6 +164,10 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
     // Addressed (AX.25) to the final <dest>; relays re-transmit it (ttl--, add
     // self to path) until it reaches dest, which delivers. Dedup by <id>.
     const MESH_PREFIX = '\x01MESH\x01'
+    // Slice 3: a delivery ack is just a MESH message back to the origin whose
+    // inner payload is this marker + the original mesh-id — so it reuses all the
+    // routing/jitter/cancellation. (\x02 so it can't look like chat text.)
+    const MESH_ACK_PREFIX = '\x02MACK\x02'
     const MESH_MAX_HOPS = 2
     const MESH_JITTER_MIN = 500       // ms — random relay backoff window
     const MESH_JITTER_MAX = 3000
@@ -334,11 +343,22 @@ export async function main(args: any, conf: Config, ks: Keystore): Promise<numbe
             noteMeshId(id)
 
             if (dest === conf.callsign) {              // delivered to us
+                if (inner.startsWith(MESH_ACK_PREFIX)) {
+                    // A routed delivery ack for one of OUR mesh sends.
+                    emit({ type: 'mesh-ack', id: inner.slice(MESH_ACK_PREFIX.length),
+                           from: origin, ts: Date.now() })
+                    return
+                }
                 emit({
                     type: 'mesh-msg', origin, dest, text: inner, path,
                     via: fromStr, verification: Verification[message.verification],
                     ts: Date.now()
                 })
+                // Auto-ack on receipt: route a tiny ack back to the origin.
+                const ackId = conf.callsign + '-a' + Math.random().toString(36).slice(2, 6)
+                noteMeshId(ackId)
+                messenger.send(origin, buildMesh(ackId, MESH_MAX_HOPS, conf.callsign, origin,
+                                                 '', MESH_ACK_PREFIX + id), signDefault).catch(() => {})
                 return
             }
             // Schedule a forward with random jitter; if another relay beats us to
